@@ -1,0 +1,14 @@
+# kube-less configuration file
+
+# List of directories to watch for Kubernetes manifests (Deployments, Secrets, ConfigMaps)
+manifest_dirs:
+  - "./examples/manifests"
+
+# Path to the Container Runtime Interface (CRI) socket
+# Common paths:
+#   containerd: /run/containerd/containerd.sock
+#   CRI-O:      /var/run/crio/crio.sock
+cri_socket_path: "/run/containerd/containerd.sock"
+
+# Reconciliation loop interval
+sync_interval: "5s"
