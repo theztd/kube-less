@@ -13,22 +13,29 @@ No Magic: Žádné skryté stavy; co je v souboru, to běží na node.
 
 3. Technical Architecture (Level 1)
 A. Input Watcher
-Monitoruje adresář /etc/epr/manifests/.
+Monitoruje adresář /etc/epr/manifests/ (konfigurovatelné).
 
 Detekuje změny (přidání, smazání, update) pomocí fsnotify.
 
 Podporované typy: apps/v1.Deployment, v1.ConfigMap, v1.Secret.
 
-B. Hydration Engine (The "MitM" Logic)
+B. Engine & State Management
+Orchestrátor, který nahrazuje K8s Controller Manager.
+
+Store: In-memory mapa držící stav workloadů (Desired vs Actual).
+
+Debug API: HTTP server poskytující náhled do interního stavu agenta.
+
+C. Hydration Engine (The "MitM" Logic)
 Protože chybí API server, EPR musí provést tzv. "Hydrataci":
 
 Deployment -> Pod: Transformuje Deployment na specifikaci Podu (použije template).
 
-Config/Secret Injection: * Pokud Pod odkazuje na ConfigMap/Secret, EPR je vyhledá v /etc/epr/configs/.
+Config/Secret Injection: * Pokud Pod odkazuje na ConfigMap/Secret, EPR je vyhledá v interním Storu (načteno z disku).
 
 Obsah namapuje do kontejneru pomocí hostPath (vytvoří dočasný soubor na hostiteli) nebo jako environment proměnné.
 
-C. Container Lifecycle Manager (CRI)
+D. Container Lifecycle Manager (CRI)
 Implementuje gRPC klienta pro k8s.io/cri-api.
 
 Sync Loop: Porovnává běžící kontejnery v runtime s požadovaným stavem v manifestech.
@@ -41,8 +48,10 @@ Service Discovery: Po úspěšném startu kontejneru zaregistruje službu do lok
 Health Checks: Lokální provádění Liveness/Readiness sond.
 
 5. Development Roadmap (MVP)
-Phase 1: Připojení k CRI socketu a výpis běžících podů.
+Phase 1: Připojení k CRI socketu a výpis běžících podů. [DONE]
 
-Phase 2: Parsování lokálního YAML souboru (Deployment) a spuštění jednoduchého Nginx podu.
+Phase 2: Parsování lokálního YAML souboru (Deployment) a spuštění jednoduchého Nginx podu. [IN PROGRESS]
+- Implementováno: Watcher, Parser, State Store, Debug API, CRI Connection.
+- Zbývá: Logika pro vytváření Sandboxů a Kontejnerů.
 
 Phase 3: Implementace ConfigMap injekce přes lokální souborový systém.

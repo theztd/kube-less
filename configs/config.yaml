@@ -6,9 +6,12 @@ manifest_dirs:
 
 # Path to the Container Runtime Interface (CRI) socket
 # Common paths:
-#   containerd: /run/containerd/containerd.sock
-#   CRI-O:      /var/run/crio/crio.sock
+#   containerd: unix:///run/containerd/containerd.sock
+#   CRI-O:      unix:///var/run/crio/crio.sock
 cri_socket_path: "unix:///Users/marek/.colima/default/containerd.sock"
 
 # Reconciliation loop interval
 sync_interval: "5s"
+
+# Debug API Port
+debug_api_port: 8080

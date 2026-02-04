@@ -20,6 +20,10 @@ type Config struct {
 	// SyncInterval is the interval for the reconciliation loop (e.g., "10s", "1m").
 	// Defaults to 10s if not set.
 	SyncInterval string `yaml:"sync_interval"`
+
+	// DebugAPIPort is the port for the debug API server.
+	// Defaults to 8080 if not set.
+	DebugAPIPort int `yaml:"debug_api_port"`
 }
 
 // Load reads the configuration from the specified file path.
@@ -46,6 +50,9 @@ func Load(path string) (*Config, error) {
 	// Set defaults
 	if cfg.SyncInterval == "" {
 		cfg.SyncInterval = "10s"
+	}
+	if cfg.DebugAPIPort == 0 {
+		cfg.DebugAPIPort = 8080
 	}
 
 	return cfg, nil
