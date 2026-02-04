@@ -8,7 +8,7 @@ manifest_dirs:
 # Common paths:
 #   containerd: /run/containerd/containerd.sock
 #   CRI-O:      /var/run/crio/crio.sock
-cri_socket_path: "/run/containerd/containerd.sock"
+cri_socket_path: "unix:///Users/marek/.colima/default/containerd.sock"
 
 # Reconciliation loop interval
 sync_interval: "5s"
