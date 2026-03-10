@@ -1,4 +1,4 @@
-package runtime
+package cri
 
 import (
 	"context"
@@ -15,16 +15,15 @@ import (
 )
 
 const (
-	// defaultTimeout is the default timeout for CRI requests.
 	defaultTimeout = 15 * time.Second
 )
 
 // Client represents a gRPC client to a CRI runtime.
 type Client struct {
-	conn         *grpc.ClientConn
+	conn          *grpc.ClientConn
 	runtimeClient runtimeapi.RuntimeServiceClient
 	imageClient   runtimeapi.ImageServiceClient
-	socketPath   string
+	socketPath    string
 }
 
 // NewClient creates a new CRI client.
@@ -41,7 +40,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 
-	// Strip the unix:// prefix if present, as net.Dial expects a filesystem path for unix sockets.
 	addr := c.socketPath
 	if strings.HasPrefix(addr, "unix://") {
 		addr = strings.TrimPrefix(addr, "unix://")
@@ -74,7 +72,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// ListPodSandbox lists existing pod sandboxes.
+// ListPodSandbox lists existing pod sandboxes, optionally filtered.
 func (c *Client) ListPodSandbox(ctx context.Context) ([]*runtimeapi.PodSandbox, error) {
 	if c.runtimeClient == nil {
 		return nil, fmt.Errorf("CRI runtime client not initialized, call Connect() first")

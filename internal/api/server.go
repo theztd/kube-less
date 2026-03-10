@@ -6,17 +6,17 @@ import (
 	"log"
 	"net/http"
 
-	"kube-less/internal/engine"
+	"kube-less/internal/scheduler"
 )
 
 // Server represents the debug API server.
 type Server struct {
-	store *engine.Store
+	store *scheduler.Store
 	port  int
 }
 
 // NewServer creates a new API server.
-func NewServer(store *engine.Store, port int) *Server {
+func NewServer(store *scheduler.Store, port int) *Server {
 	return &Server{
 		store: store,
 		port:  port,

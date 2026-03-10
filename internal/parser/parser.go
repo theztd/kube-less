@@ -1,4 +1,4 @@
-package manifest
+package parser
 
 import (
 	"bytes"
@@ -18,7 +18,6 @@ import (
 // Parser provides functionality to parse Kubernetes YAML manifests.
 type Parser struct {
 	decoder runtime.Decoder
-	// Add a mapping for supported GVKs if needed, or check types directly
 }
 
 // NewParser creates a new Parser instance.
@@ -30,8 +29,8 @@ func NewParser() *Parser {
 
 // Parse takes a byte slice containing one or more YAML documents and
 // returns a slice of parsed Kubernetes objects.
-// It only decodes objects that are part of the k8s.io/client-go scheme.Scheme
-// and specifically filters for Deployment, ConfigMap, and Secret.
+// Supported types: Deployment, ConfigMap, Secret.
+// Unknown types are logged and skipped without error.
 func (p *Parser) Parse(data []byte) ([]runtime.Object, error) {
 	var objects []runtime.Object
 	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
@@ -46,29 +45,26 @@ func (p *Parser) Parse(data []byte) ([]runtime.Object, error) {
 		}
 
 		if len(rawObj.Raw) == 0 {
-			continue // Skip empty documents
+			continue
 		}
 
 		obj, gvk, err := p.decoder.Decode(rawObj.Raw, nil, nil)
 		if err != nil {
-			// If it's an unrecognized type, we might want to log and skip, or return error.
-			// For now, let's log and skip.
-			log.Printf("Warning: Unrecognized object type in manifest, skipping: %v, error: %v", string(rawObj.Raw), err)
+			log.Printf("Warning: unrecognized object in manifest, skipping: %v", err)
 			continue
 		}
 
-		// Filter for supported types
 		if p.isSupportedGVK(*gvk) {
 			objects = append(objects, obj)
 		} else {
-			log.Printf("Info: Skipping unsupported GVK: %s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
+			log.Printf("Info: skipping unsupported GVK: %s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
 		}
 	}
 
 	return objects, nil
 }
 
-// isSupportedGVK checks if the given GroupVersionKind is one of the types we care about.
+// isSupportedGVK checks if the given GroupVersionKind is one of the types we handle.
 func (p *Parser) isSupportedGVK(gvk schema.GroupVersionKind) bool {
 	switch gvk {
 	case appsv1.SchemeGroupVersion.WithKind("Deployment"):
@@ -83,7 +79,6 @@ func (p *Parser) isSupportedGVK(gvk schema.GroupVersionKind) bool {
 }
 
 // LoadAndParseFile reads a file from the given path and parses its contents.
-// This is a convenience function for direct file parsing, not used by the watcher directly.
 func (p *Parser) LoadAndParseFile(filePath string) ([]runtime.Object, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {

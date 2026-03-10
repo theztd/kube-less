@@ -1,4 +1,4 @@
-package manifest
+package watcher
 
 import (
 	"context"
@@ -43,18 +43,16 @@ func NewWatcher(dirs []string) (*Watcher, error) {
 	w := &Watcher{
 		watcher: fsWatcher,
 		dirs:    dirs,
-		events:  make(chan Event, 100), // Buffered channel
+		events:  make(chan Event, 100),
 	}
 
 	for _, dir := range dirs {
-		// Ensure directory exists
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			log.Printf("Warning: Manifest directory does not exist, skipping: %s", dir)
 			continue
 		}
 
 		if err := fsWatcher.Add(dir); err != nil {
-			// Clean up if adding fails
 			fsWatcher.Close()
 			return nil, fmt.Errorf("failed to watch directory %s: %w", dir, err)
 		}
@@ -97,7 +95,6 @@ func (w *Watcher) Start(ctx context.Context) {
 
 // handleEvent processes the raw fsnotify event and sends it to the Events channel if relevant.
 func (w *Watcher) handleEvent(event fsnotify.Event) {
-	// Ignore temporary files or non-yaml files
 	ext := strings.ToLower(filepath.Ext(event.Name))
 	if ext != ".yaml" && ext != ".yml" {
 		return
@@ -105,7 +102,6 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	var eventType EventType
 
-	// Determine generic event type
 	if event.Has(fsnotify.Create) {
 		eventType = EventAdded
 	} else if event.Has(fsnotify.Write) {
@@ -113,7 +109,7 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	} else if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 		eventType = EventDeleted
 	} else {
-		return // Ignore Chmod and others
+		return
 	}
 
 	w.events <- Event{

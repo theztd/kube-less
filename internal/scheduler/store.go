@@ -1,4 +1,4 @@
-package engine
+package scheduler
 
 import (
 	"sync"
@@ -20,24 +20,18 @@ const (
 
 // WorkloadState represents the state of a single workload (e.g., a Deployment).
 type WorkloadState struct {
-	// Name is the name of the workload (e.g., "nginx").
-	Name string `json:"name"`
-	// Namespace is the namespace of the workload (e.g., "default").
-	Namespace string `json:"namespace"`
-	// Manifest is the desired state (parsed from YAML).
-	Manifest *appsv1.Deployment `json:"-"` // Don't serialize the full manifest
-	// PodSandboxID is the ID of the CRI sandbox if it exists.
-	PodSandboxID string `json:"pod_sandbox_id,omitempty"`
-	// Status is the current status of the workload.
-	Status PodStatus `json:"status"`
-	// LastUpdated is the timestamp of the last state change.
-	LastUpdated time.Time `json:"last_updated"`
+	Name         string             `json:"name"`
+	Namespace    string             `json:"namespace"`
+	Manifest     *appsv1.Deployment `json:"-"`
+	PodSandboxID string             `json:"pod_sandbox_id,omitempty"`
+	Status       PodStatus          `json:"status"`
+	LastUpdated  time.Time          `json:"last_updated"`
 }
 
 // Store is a thread-safe in-memory store for tracking workload states.
 type Store struct {
 	mu        sync.RWMutex
-	workloads map[string]*WorkloadState // Key is "namespace/name"
+	workloads map[string]*WorkloadState
 }
 
 // NewStore creates a new Store instance.
@@ -47,7 +41,7 @@ func NewStore() *Store {
 	}
 }
 
-// UpdateWorkload updates the state of a workload.
+// UpdateWorkload upserts the desired state for a workload.
 func (s *Store) UpdateWorkload(namespace, name string, manifest *appsv1.Deployment) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,10 +79,8 @@ func (s *Store) GetWorkloads() []*WorkloadState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var result []*WorkloadState
+	result := make([]*WorkloadState, 0, len(s.workloads))
 	for _, w := range s.workloads {
-		// Return a copy to avoid race conditions if the caller modifies it (though pointers are still shared)
-		// For display purposes, this shallow copy of the struct is fine.
 		copy := *w
 		result = append(result, &copy)
 	}
@@ -106,13 +98,13 @@ func keyFunc(namespace, name string) string {
 	return namespace + "/" + name
 }
 
-// Helper: Translate CRI State to PodStatus
+// TranslateCRIState maps a CRI sandbox state to our internal PodStatus.
 func TranslateCRIState(state runtimeapi.PodSandboxState) PodStatus {
 	switch state {
 	case runtimeapi.PodSandboxState_SANDBOX_READY:
 		return PodStatusRunning
 	case runtimeapi.PodSandboxState_SANDBOX_NOTREADY:
-		return PodStatusPending // Or Stopped, depending on context
+		return PodStatusPending
 	default:
 		return PodStatusUnknown
 	}
