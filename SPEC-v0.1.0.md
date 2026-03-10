@@ -40,9 +40,9 @@ PullImage(ctx, image string) error
 Každá metoda nastavuje vlastní timeout přes `context.WithTimeout` (doporučeno 30 s
 pro PullImage, 10 s pro ostatní).
 
-### 1.3 Hydration Engine – Deployment → CRI konfigurační objekty
+### 1.3 Překlad Deployment → CRI konfigurační objekty
 
-Nový balík `internal/hydration` s funkcí:
+Součást balíku `internal/cri`:
 
 ```go
 func BuildPodSandboxConfig(dep *appsv1.Deployment) *runtimeapi.PodSandboxConfig
@@ -68,7 +68,7 @@ Mapování polí Deployment → CRI:
 Anotace `kube-less.io/pull-policy: always|never|ifnotpresent` na Deployment
 přeloží na chování PullImage před spuštěním (default: `ifnotpresent`).
 
-### 1.4 Engine – reconciliační smyčka
+### 1.4 Scheduler – reconciliační smyčka
 
 `StartReconciliationLoop` musí být plně funkční:
 
@@ -76,9 +76,10 @@ přeloží na chování PullImage před spuštěním (default: `ifnotpresent`).
 každých <sync_interval>:
   pro každý workload ve Store:
     desired  = workload.Manifest (parsovaný Deployment)
-    actual   = CRI stav (ListPodSandbox + ListContainers)
+    actual   = dotaz na CRI runtime (ListPodSandbox + ListContainers)
     diff     = compare(desired, actual)
     aplikuj diff (create / update / delete)
+              → pořadí: network namespace → bridge/iptables → cri sandbox → cri containers
 ```
 
 `compare` vrátí jednu z akcí:
@@ -309,27 +310,84 @@ Pokud Deployment nemá definovanou `readinessProbe`:
 
 ---
 
-## 5. Přehled nových/změněných souborů
+## 5. Architektura balíků
+
+### 5.1 Datový tok
+
+```
+fsnotify
+   │ (channel)
+   ▼
+watcher         – příjem raw FS eventů, deduplikace
+   │ (channel)
+   ▼
+parser          – čtení souboru, YAML → runtime.Object, validace
+   │             hlásí chyby zpět (log + drop), předává OK objekty
+   ▼
+scheduler       – porovnání desired vs actual, výpočet diffu,
+   │             orchestrace volání CRI + network ve správném pořadí
+   ├──► cri     – čistý executor CRI operací (sandbox, container, image)
+   └──► network – bridge, iptables, network namespace
+```
+
+### 5.2 Správa stavu – pull model
+
+Scheduler si **aktivně dotazuje** CRI runtime pro actual stav
+(`ListPodSandbox`, `ListContainers`) – CRI scheduler nezpětně neinformuje.
+
+```
+desiredState  ← objekty z parseru (uloženo v interním Store)
+actualState   ← dotaz na CRI runtime (před každou reconciliací)
+diff          = reconcile(desired, actual)
+              → volá cri + network
+```
+
+Výhoda: scheduler může rekonstruovat stav z reality i po restartu,
+bez přidané vazby v opačném směru.
+
+### 5.3 Pořadí operací (create)
+
+```
+1. network namespace (izolace)
+2. bridge + iptables (síťová konektivita)
+3. cri.RunPodSandbox
+4. cri.CreateContainer + cri.StartContainer
+```
+
+Teardown probíhá v obráceném pořadí. Toto řadí **scheduler**,
+nikoli balík `cri` – protože `cri` o `network` objektech neví.
+
+### 5.4 Přehled nových/změněných souborů
 
 ```
 internal/
-  hydration/
-    builder.go          # BuildPodSandboxConfig, BuildContainerConfigs
-    builder_test.go
+  watcher/
+    watcher.go          # fsnotify wrapper, deduplikace eventů
+  parser/
+    parser.go           # YAML → runtime.Object, validace
+                        # překládá Deployment → interní typy pro scheduler
+    parser_test.go
+  scheduler/
+    scheduler.go        # reconcile loop, orchestrace, startup sync
+    store.go            # desired state store (workloads, configMaps, secrets)
+                        # +fileToWorkloads, +ConfigHash, +Ready, +SandboxIP,
+                        # +StartedAt, +ContainerIDs
+    reconciler.go       # compare(desired, actual) → Action
+                        # applyDiff() → volá cri + network ve správném pořadí
+  cri/
+    client.go           # čistý CRI gRPC klient
+                        # +RunPodSandbox, +StopPodSandbox, +RemovePodSandbox,
+                        # +CreateContainer, +StartContainer, +StopContainer,
+                        # +RemoveContainer, +ListContainers, +PullImage
+                        # +BuildPodSandboxConfig, +BuildContainerConfigs
+                        #  (překlad Deployment → CRI config objekty)
+  network/
+    bridge.go           # vytvoření/smazání Linux bridge
+    namespace.go        # network namespace + adresář s daty
+    iptables.go         # pravidla pro NAT / port-forward
   probe/
     runner.go           # ProbeRunner
     runner_test.go
-  runtime/
-    client.go           # +RunPodSandbox, +StopPodSandbox, +RemovePodSandbox,
-                        #  +CreateContainer, +StartContainer, +StopContainer,
-                        #  +RemoveContainer, +ListContainers, +PullImage
-  engine/
-    store.go            # +configMaps, +secrets, +fileToWorkloads,
-                        #  +ConfigHash, +Ready, +SandboxIP, +StartedAt,
-                        #  +ContainerIDs
-    engine.go           # plná reconciliační smyčka, handleRemove,
-                        #  startup reconciliation
-    reconciler.go       # (nový) compare() + applyDiff()
   api/
     server.go           # +GET /endpoints
   config/
@@ -338,42 +396,51 @@ configs/
   config.yaml           # +data_dir: /var/lib/kube-less
 ```
 
+> **Poznámka k přejmenování:** původní `internal/engine` → `internal/scheduler`,
+> původní `internal/hydration` → překlad Deployment→CRI config je součástí
+> balíku `cri` (BuildPodSandboxConfig / BuildContainerConfigs),
+> původní `internal/manifest` → `internal/watcher` + `internal/parser`.
+
 ---
 
 ## 6. Pořadí implementace (milníky)
 
 ### Milestone A – Základní create/delete (unblockuje vše ostatní)
-1. `runtime/client.go` – přidat všechny chybějící CRI metody
-2. `hydration/builder.go` – základní BuildPodSandboxConfig + BuildContainerConfigs
+1. `cri/client.go` – přidat všechny chybějící CRI metody
+2. `cri/client.go` – BuildPodSandboxConfig + BuildContainerConfigs
    (bez ConfigMap injekcí, jen literální env a image)
-3. `engine/engine.go` – handleUpdate volá create pipeline (PullImage →
-   RunPodSandbox → CreateContainer → StartContainer)
-4. `engine/engine.go` – handleRemove volá delete pipeline
+3. `network/` – bridge, namespace, iptables (základní implementace)
+4. `scheduler/scheduler.go` – handleUpdate: orchestrace create pipeline
+   (network namespace → bridge/iptables → PullImage → RunPodSandbox →
+   CreateContainer → StartContainer)
+5. `scheduler/scheduler.go` – handleRemove: orchestrace delete pipeline
+   (teardown v obráceném pořadí)
 
 ### Milestone B – Reconciliace a odolnost vůči restartu
-5. `engine/store.go` – fileToWorkloads, ConfigHash, ContainerIDs, SandboxIP,
+6. `scheduler/store.go` – fileToWorkloads, ConfigHash, ContainerIDs, SandboxIP,
    StartedAt
-6. `engine/reconciler.go` – compare() + applyDiff()
-7. `engine/engine.go` – plná StartReconciliationLoop
-8. Startup reconciliation (načtení souborů → sync s CRI před spuštěním Watcheru)
+7. `scheduler/reconciler.go` – compare() + applyDiff()
+   (actual state = pull z CRI, ne push od CRI)
+8. `scheduler/scheduler.go` – plná StartReconciliationLoop
+9. Startup reconciliation (načtení souborů → sync s CRI před spuštěním Watcheru)
 
 ### Milestone C – ConfigMap a Secret injekce
-9. `engine/store.go` – configMaps, secrets maps
-10. `engine/engine.go` – routování ConfigMap/Secret při parsování
-11. `hydration/builder.go` – env reference (configMapKeyRef, secretKeyRef)
-12. `hydration/builder.go` – FS mount (zápis na hostPath)
-13. Cleanup hostPath souborů při smazání CM / Deploymetu
+10. `scheduler/store.go` – configMaps, secrets maps
+11. `parser/parser.go` – routování ConfigMap/Secret při parsování
+12. `cri/client.go` – BuildContainerConfigs: env reference (configMapKeyRef, secretKeyRef)
+13. `cri/client.go` – BuildContainerConfigs: FS mount (zápis na hostPath)
+14. Cleanup hostPath souborů při smazání CM / Deploymetu
 
 ### Milestone D – HTTP sondy a endpoints API
-14. `engine/store.go` – Ready bool, ReadyContainers int
-15. `probe/runner.go` – ProbeRunner s HTTP GET sondou
-16. Integrace ProbeRunneru do main.go
-17. `api/server.go` – GET /endpoints
+15. `scheduler/store.go` – Ready bool, ReadyContainers int
+16. `probe/runner.go` – ProbeRunner s HTTP GET sondou
+17. Integrace ProbeRunneru do main.go
+18. `api/server.go` – GET /endpoints
 
 ### Milestone E – Finalizace
-18. `config/config.go` – DataDir
-19. Testy pro hydration a probe balíky
-20. Aktualizace README a examples/manifests (přidat readinessProbe ukázku)
+19. `config/config.go` – DataDir
+20. Testy pro cri a probe balíky
+21. Aktualizace README a examples/manifests (přidat readinessProbe ukázku)
 
 ---
 
