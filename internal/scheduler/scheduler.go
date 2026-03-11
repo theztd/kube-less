@@ -2,8 +2,10 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -99,6 +101,11 @@ func (s *Scheduler) reconcileAll(ctx context.Context) {
 			actualHash = actual.Annotations["kube-less/config-hash"]
 		}
 
+		if ws.Manifest == nil {
+			log.Printf("Reconcile: skipping %s/%s (no manifest)", ws.Namespace, ws.Name)
+			continue
+		}
+
 		action := compare(ws, actualSandboxID, actualHash)
 		if action == ActionNone {
 			continue
@@ -115,6 +122,64 @@ func (s *Scheduler) reconcileAll(ctx context.Context) {
 			s.deleteWorkload(ctx, *ws)
 			s.store.DeleteWorkload(ws.Namespace, ws.Name)
 		}
+	}
+}
+
+// LoadManifests reads all YAML files from the given directories and populates the
+// store with desired state synchronously. Must be called before SyncStateFromCRI.
+// Individual file parse errors are logged and skipped; only directory-read errors
+// are returned.
+func (s *Scheduler) LoadManifests(manifestDirs []string) error {
+	var errs []string
+	for _, dir := range manifestDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			log.Printf("LoadManifests: failed to read dir %s: %v", dir, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", dir, err))
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+				continue
+			}
+			s.loadManifestFile(filepath.Join(dir, name))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("LoadManifests: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// loadManifestFile parses one YAML file and updates the store (desired state only,
+// no CRI calls). Mirrors the parse path of handleUpdate without the create pipeline.
+func (s *Scheduler) loadManifestFile(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Printf("LoadManifests: failed to read %s: %v", filePath, err)
+		return
+	}
+	objects, err := s.parser.Parse(data)
+	if err != nil {
+		log.Printf("LoadManifests: failed to parse %s: %v", filePath, err)
+		return
+	}
+	var keys []string
+	for _, obj := range objects {
+		dep, ok := obj.(*appsv1.Deployment)
+		if !ok {
+			continue
+		}
+		s.store.UpdateWorkload(dep.Namespace, dep.Name, dep)
+		keys = append(keys, keyFunc(dep.Namespace, dep.Name))
+	}
+	if len(keys) > 0 {
+		s.store.SetFileWorkloads(filePath, keys)
+		log.Printf("LoadManifests: loaded %d workload(s) from %s", len(keys), filePath)
 	}
 }
 
@@ -220,6 +285,12 @@ func (s *Scheduler) createWorkload(ctx context.Context, dep *appsv1.Deployment) 
 	}
 
 	sbConfig := cri.BuildPodSandboxConfig(dep)
+	// Stamp the config hash as a sandbox annotation so reconcileAll can detect changes.
+	if sbConfig.Annotations == nil {
+		sbConfig.Annotations = make(map[string]string)
+	}
+	sbConfig.Annotations["kube-less/config-hash"] = ComputeConfigHash(dep)
+
 	containerConfigs, err := cri.BuildContainerConfigs(dep, sbConfig, nil, nil)
 	if err != nil {
 		return err
@@ -304,16 +375,22 @@ func (s *Scheduler) pullImageWithPolicy(ctx context.Context, dep *appsv1.Deploym
 	}
 }
 
-// SyncStateFromCRI loads manifests and reconciles against the running CRI state at startup.
+// SyncStateFromCRI reconciles the store (populated by LoadManifests) against the
+// actual running CRI state. Must be called after LoadManifests, before the watcher starts.
+//
+// Outcomes per workload:
+//   - Sandbox running + manifest exists  → update store with sandbox/container IDs and IP
+//   - Sandbox running + no manifest      → orphan: stop + remove
+//   - Manifest exists + no sandbox       → no-op here; reconcileAll will create it
 func (s *Scheduler) SyncStateFromCRI(ctx context.Context) error {
 	sandboxes, err := s.client.ListPodSandbox(ctx, &runtimeapi.PodSandboxFilter{
 		LabelSelector: map[string]string{cri.LabelManaged: "true"},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("SyncStateFromCRI: list sandboxes: %w", err)
 	}
 
-	// Build index of running kube-less sandboxes
+	// Build index of running kube-less sandboxes by workload key
 	runningByKey := make(map[string]*runtimeapi.PodSandbox)
 	for _, sb := range sandboxes {
 		ns := sb.Labels[cri.LabelNamespace]
@@ -323,19 +400,37 @@ func (s *Scheduler) SyncStateFromCRI(ctx context.Context) error {
 		}
 	}
 
-	// Reconcile desired state (Store) against actual CRI state
+	// For each desired workload: find its running sandbox and update store runtime state
 	for _, ws := range s.store.GetWorkloads() {
 		key := keyFunc(ws.Namespace, ws.Name)
 		sb, running := runningByKey[key]
-		if running {
-			// Update store with the actual sandbox ID
-			s.store.UpdatePodStatus(ws.Namespace, ws.Name, sb.Id, TranslateCRIState(sb.State))
-			delete(runningByKey, key)
+		if !running {
+			// No sandbox yet – reconcileAll will create it on the next tick
+			continue
 		}
-		// If manifest exists but no sandbox, reconcileAll will create it on the next tick
+
+		// Fetch container IDs belonging to this sandbox
+		var containerIDs []string
+		if ctrs, err := s.client.ListContainers(ctx, &runtimeapi.ContainerFilter{PodSandboxId: sb.Id}); err == nil {
+			for _, c := range ctrs {
+				containerIDs = append(containerIDs, c.Id)
+			}
+		}
+
+		// Fetch sandbox IP
+		sandboxIP := ""
+		if status, err := s.client.PodSandboxStatus(ctx, sb.Id); err == nil {
+			if net := status.GetNetwork(); net != nil {
+				sandboxIP = net.GetIp()
+			}
+		}
+
+		s.store.UpdateRuntimeStatus(ws.Namespace, ws.Name, sb.Id, containerIDs, sandboxIP, TranslateCRIState(sb.State))
+		log.Printf("SyncStateFromCRI: %s/%s matched sandbox %s (ip=%s, containers=%d)", ws.Namespace, ws.Name, sb.Id, sandboxIP, len(containerIDs))
+		delete(runningByKey, key)
 	}
 
-	// Orphaned sandboxes (running but no manifest) → remove
+	// Any remaining sandboxes have no manifest → orphans, remove them
 	for key, sb := range runningByKey {
 		log.Printf("SyncStateFromCRI: removing orphaned sandbox %s (%s)", sb.Id, key)
 		if err := s.client.StopPodSandbox(ctx, sb.Id); err != nil {

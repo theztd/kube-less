@@ -50,7 +50,7 @@ func NewStore() *Store {
 	}
 }
 
-// UpdateWorkload upserts the desired manifest for a workload.
+// UpdateWorkload upserts the desired manifest for a workload and pre-computes its ConfigHash.
 func (s *Store) UpdateWorkload(namespace, name string, manifest *appsv1.Deployment) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,6 +66,7 @@ func (s *Store) UpdateWorkload(namespace, name string, manifest *appsv1.Deployme
 		s.workloads[key] = state
 	}
 	state.Manifest = manifest
+	state.ConfigHash = computeConfigHash(manifest)
 	state.LastUpdated = time.Now()
 }
 
@@ -85,6 +86,24 @@ func (s *Store) SetWorkloadRuntime(namespace, name, sandboxID string, containerI
 	state.ConfigHash = configHash
 	state.StartedAt = time.Now()
 	state.Status = PodStatusRunning
+	state.LastUpdated = time.Now()
+}
+
+// UpdateRuntimeStatus updates the CRI runtime data for a workload without touching ConfigHash.
+// Used by SyncStateFromCRI to record actual sandbox/container IDs at startup.
+func (s *Store) UpdateRuntimeStatus(namespace, name, sandboxID string, containerIDs []string, sandboxIP string, status PodStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := keyFunc(namespace, name)
+	state, exists := s.workloads[key]
+	if !exists {
+		return
+	}
+	state.PodSandboxID = sandboxID
+	state.ContainerIDs = containerIDs
+	state.SandboxIP = sandboxIP
+	state.Status = status
 	state.LastUpdated = time.Now()
 }
 
@@ -176,9 +195,12 @@ func TranslateCRIState(state runtimeapi.PodSandboxState) PodStatus {
 // ComputeConfigHash returns a SHA256 hex digest of the deployment's PodTemplateSpec.
 // Used to detect configuration changes that require a pod restart.
 func ComputeConfigHash(dep *appsv1.Deployment) string {
+	return computeConfigHash(dep)
+}
+
+func computeConfigHash(dep *appsv1.Deployment) string {
 	data, err := json.Marshal(dep.Spec.Template.Spec)
 	if err != nil {
-		// Fallback: hash the deployment name+namespace (always deterministic)
 		data = []byte(fmt.Sprintf("%s/%s", dep.Namespace, dep.Name))
 	}
 	sum := sha256.Sum256(data)
