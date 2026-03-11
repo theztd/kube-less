@@ -249,3 +249,181 @@ func TestComputeConfigHash_DifferentSpec(t *testing.T) {
 		t.Error("different specs should produce different hashes")
 	}
 }
+
+// ── ConfigMap store tests ─────────────────────────────────────────────────────
+
+func TestUpdateConfigMap_GetConfigMap(t *testing.T) {
+	s := NewStore()
+	cm := &v1.ConfigMap{Data: map[string]string{"key": "value"}}
+	s.UpdateConfigMap("default", "app-config", cm)
+
+	got := s.GetConfigMap("default", "app-config")
+	if got == nil {
+		t.Fatal("expected ConfigMap, got nil")
+	}
+	if got.Data["key"] != "value" {
+		t.Errorf("expected value=value, got %s", got.Data["key"])
+	}
+}
+
+func TestGetConfigMap_Missing_ReturnsNil(t *testing.T) {
+	s := NewStore()
+	if cm := s.GetConfigMap("default", "missing"); cm != nil {
+		t.Errorf("expected nil, got %+v", cm)
+	}
+}
+
+func TestDeleteConfigMap(t *testing.T) {
+	s := NewStore()
+	s.UpdateConfigMap("default", "app-config", &v1.ConfigMap{})
+	s.DeleteConfigMap("default", "app-config")
+	if cm := s.GetConfigMap("default", "app-config"); cm != nil {
+		t.Error("expected nil after delete")
+	}
+}
+
+func TestGetAllConfigMaps_ReturnsCopy(t *testing.T) {
+	s := NewStore()
+	s.UpdateConfigMap("default", "cm1", &v1.ConfigMap{Data: map[string]string{"k": "v"}})
+	s.UpdateConfigMap("default", "cm2", &v1.ConfigMap{Data: map[string]string{"k": "v2"}})
+
+	all := s.GetAllConfigMaps()
+	if len(all) != 2 {
+		t.Fatalf("expected 2 configmaps, got %d", len(all))
+	}
+	// Mutating the copy should not affect the store
+	delete(all, "default/cm1")
+	if s.GetConfigMap("default", "cm1") == nil {
+		t.Error("store should not be mutated by modifying GetAllConfigMaps result")
+	}
+}
+
+func TestUpdateConfigMap_RecomputesWorkloadHash(t *testing.T) {
+	s := NewStore()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Template: v1.PodTemplateSpec{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name: "web",
+						Env: []v1.EnvVar{{
+							Name: "DB_HOST",
+							ValueFrom: &v1.EnvVarSource{
+								ConfigMapKeyRef: &v1.ConfigMapKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{Name: "app-config"},
+									Key:                  "db_host",
+								},
+							},
+						}},
+					}},
+				},
+			},
+		},
+	}
+	s.UpdateWorkload("default", "web", dep)
+	hashBefore := s.GetWorkload("default", "web").ConfigHash
+
+	// Update the referenced ConfigMap
+	s.UpdateConfigMap("default", "app-config", &v1.ConfigMap{
+		Data: map[string]string{"db_host": "postgres:5432"},
+	})
+	hashAfter := s.GetWorkload("default", "web").ConfigHash
+
+	if hashBefore == hashAfter {
+		t.Error("workload hash should change when referenced ConfigMap is updated")
+	}
+}
+
+// ── Secret store tests ────────────────────────────────────────────────────────
+
+func TestUpdateSecret_GetSecret(t *testing.T) {
+	s := NewStore()
+	sec := &v1.Secret{Data: map[string][]byte{"api_key": []byte("secret")}}
+	s.UpdateSecret("default", "app-secret", sec)
+
+	got := s.GetSecret("default", "app-secret")
+	if got == nil {
+		t.Fatal("expected Secret, got nil")
+	}
+	if string(got.Data["api_key"]) != "secret" {
+		t.Errorf("expected api_key=secret, got %s", string(got.Data["api_key"]))
+	}
+}
+
+func TestDeleteSecret(t *testing.T) {
+	s := NewStore()
+	s.UpdateSecret("default", "app-secret", &v1.Secret{})
+	s.DeleteSecret("default", "app-secret")
+	if sec := s.GetSecret("default", "app-secret"); sec != nil {
+		t.Error("expected nil after delete")
+	}
+}
+
+func TestUpdateSecret_RecomputesWorkloadHash(t *testing.T) {
+	s := NewStore()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Template: v1.PodTemplateSpec{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{
+						Name: "web",
+						Env: []v1.EnvVar{{
+							Name: "API_KEY",
+							ValueFrom: &v1.EnvVarSource{
+								SecretKeyRef: &v1.SecretKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{Name: "app-secret"},
+									Key:                  "api_key",
+								},
+							},
+						}},
+					}},
+				},
+			},
+		},
+	}
+	s.UpdateWorkload("default", "web", dep)
+	hashBefore := s.GetWorkload("default", "web").ConfigHash
+
+	s.UpdateSecret("default", "app-secret", &v1.Secret{
+		Data: map[string][]byte{"api_key": []byte("newsecret")},
+	})
+	hashAfter := s.GetWorkload("default", "web").ConfigHash
+
+	if hashBefore == hashAfter {
+		t.Error("workload hash should change when referenced Secret is updated")
+	}
+}
+
+// ── File → CM/Secret mapping tests ───────────────────────────────────────────
+
+func TestFileCMs_SetGetDelete(t *testing.T) {
+	s := NewStore()
+	s.SetFileCMs("/manifests/config.yaml", []string{"default/cm1", "default/cm2"})
+
+	keys := s.GetFileCMs("/manifests/config.yaml")
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+
+	s.DeleteFileCMs("/manifests/config.yaml")
+	if k := s.GetFileCMs("/manifests/config.yaml"); len(k) != 0 {
+		t.Errorf("expected empty after delete, got %v", k)
+	}
+}
+
+func TestFileSecrets_SetGetDelete(t *testing.T) {
+	s := NewStore()
+	s.SetFileSecrets("/manifests/secret.yaml", []string{"default/mysecret"})
+
+	keys := s.GetFileSecrets("/manifests/secret.yaml")
+	if len(keys) != 1 || keys[0] != "default/mysecret" {
+		t.Errorf("unexpected keys: %v", keys)
+	}
+
+	s.DeleteFileSecrets("/manifests/secret.yaml")
+	if k := s.GetFileSecrets("/manifests/secret.yaml"); len(k) != 0 {
+		t.Errorf("expected empty after delete, got %v", k)
+	}
+}

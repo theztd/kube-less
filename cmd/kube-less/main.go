@@ -58,7 +58,7 @@ func main() {
 
 	// Initialize Store and Scheduler
 	store := scheduler.NewStore()
-	sched := scheduler.NewScheduler(store, criClient, p)
+	sched := scheduler.NewScheduler(store, criClient, p, cfg.DataDir)
 
 	// ── Startup sequence (spec §2.2) ──────────────────────────────────────────
 	// 1. Load all manifests from disk → populate desired state in Store

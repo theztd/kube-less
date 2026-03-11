@@ -493,13 +493,21 @@ configs/
     `SyncStateFromCRI` → `StartReconciliationLoop` → watcher
 15. ✅ Testy: `scheduler/scheduler_test.go` (14 testů – mock CRI)
 
-### Milestone C – ConfigMap a Secret injekce
-16. `scheduler/store.go` – přidat `configMaps`, `secrets` maps
-17. `scheduler/scheduler.go` / `parser` – routování `ConfigMap`/`Secret` při parsování
-    do store (oddělit od Deployment pipeline)
-18. `cri/builder.go` – `BuildContainerConfigs`: FS mount (zápis souborů na `data_dir/configmaps/`)
-19. `scheduler/scheduler.go` – cleanup hostPath souborů při smazání CM / Deploymetu
-20. Re-reconciliation Deploymentů při změně CM/Secret (přepočítat hash)
+### Milestone C – ConfigMap a Secret injekce ✅
+16. ✅ `scheduler/store.go` – přidány `configMaps`, `secrets` maps; `fileToCMs`, `fileToSecrets`;
+    `recomputeWorkloadHashes()` při každé změně CM/Secret
+17. ✅ `scheduler/scheduler.go` – routování `ConfigMap`/`Secret` v `loadManifestFile` a
+    `handleUpdate`; cleanup při `handleRemove`
+18. ✅ `cri/builder.go` – `BuildContainerConfigs(dep, sbConfig, cms, secrets, dataDir)`:
+    FS mount – zápis CM souborů do `<dataDir>/configmaps/<ns>/<cm-name>/`, read-only mount
+19. ✅ `scheduler/scheduler.go` – `cleanupConfigMapFiles`: odstraní hostPath adresáře při
+    smazání Deploymetu nebo CM souboru
+20. ✅ Re-reconciliation: `computeEffectiveHash` zahrnuje data všech referencovaných CM/Secret;
+    `computeEffectiveHashWithStore` helper v scheduleru; sandbox anotace `kube-less/config-hash`
+    se aktualizuje při create; `reconcileAll` detekuje rozdíl a provede recreate
+21. ✅ Testy: `store_test.go` (+10 testů: CM/Secret CRUD, hash recompute), `builder_test.go`
+    (+3 testy: volume mount, missing CM error, optional CM skip), `scheduler_test.go`
+    (+5 testů: LoadManifests CM/Secret, hash change detection)
 
 ### Milestone D – HTTP sondy a endpoints API
 21. `scheduler/store.go` – `Ready bool`, `ReadyContainers int`

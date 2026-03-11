@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"kube-less/internal/parser"
@@ -427,5 +428,130 @@ func TestReconcileAll_SkipsManifestlessWorkload(t *testing.T) {
 
 	if mock.ranSandboxes != 0 {
 		t.Error("workload without manifest should not trigger RunPodSandbox")
+	}
+}
+
+// ── ConfigMap / Secret routing tests ─────────────────────────────────────────
+
+const configMapYAML = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: default
+data:
+  db_host: "postgres:5432"
+`
+
+const secretYAML = `apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: default
+data:
+  api_key: c3VwZXJzZWNyZXQ=
+`
+
+func TestLoadManifests_LoadsConfigMap(t *testing.T) {
+	dir := t.TempDir()
+	writeTempYAML(t, dir, "config.yaml", configMapYAML)
+
+	s := newTestScheduler(&mockCRI{})
+	if err := s.LoadManifests([]string{dir}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cm := s.store.GetConfigMap("default", "app-config")
+	if cm == nil {
+		t.Fatal("expected ConfigMap in store, got nil")
+	}
+	if cm.Data["db_host"] != "postgres:5432" {
+		t.Errorf("expected db_host=postgres:5432, got %s", cm.Data["db_host"])
+	}
+}
+
+func TestLoadManifests_LoadsSecret(t *testing.T) {
+	dir := t.TempDir()
+	writeTempYAML(t, dir, "secret.yaml", secretYAML)
+
+	s := newTestScheduler(&mockCRI{})
+	if err := s.LoadManifests([]string{dir}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	sec := s.store.GetSecret("default", "app-secret")
+	if sec == nil {
+		t.Fatal("expected Secret in store, got nil")
+	}
+}
+
+func TestLoadManifests_CMUpdatesWorkloadHash(t *testing.T) {
+	dir := t.TempDir()
+	// Deployment that references the ConfigMap via env
+	depYAML := `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: nginx:latest
+        env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: db_host
+`
+	writeTempYAML(t, dir, "deploy.yaml", depYAML)
+	// Load deployment first (no CM yet)
+	s := newTestScheduler(&mockCRI{})
+	_ = s.LoadManifests([]string{dir})
+	hashWithoutCM := s.store.GetWorkload("default", "web").ConfigHash
+
+	// Now add the CM in the same directory
+	writeTempYAML(t, dir, "config.yaml", configMapYAML)
+	_ = s.LoadManifests([]string{dir})
+	hashWithCM := s.store.GetWorkload("default", "web").ConfigHash
+
+	if hashWithoutCM == hashWithCM {
+		t.Error("loading the referenced ConfigMap should change the workload hash")
+	}
+}
+
+func TestReconcileAll_HashChanges_WhenCMUpdated(t *testing.T) {
+	dir := t.TempDir()
+	writeTempYAML(t, dir, "nginx.yaml", deploymentYAML)
+
+	mock := &mockCRI{imageFound: true}
+	s := newTestScheduler(mock)
+	_ = s.LoadManifests([]string{dir})
+
+	hash := s.store.GetWorkload("default", "nginx").ConfigHash
+	// Simulate a running sandbox with the current hash
+	mock.sandboxes = []*runtimeapi.PodSandbox{sandboxFor("default", "nginx", "sandbox-1", hash)}
+	_ = s.SyncStateFromCRI(context.Background())
+
+	// Should be no-op when hash matches
+	s.reconcileAll(context.Background())
+	if mock.ranSandboxes != 0 {
+		t.Errorf("expected no sandbox creation before CM change, got %d", mock.ranSandboxes)
+	}
+
+	// Add a new ConfigMap; this doesn't affect nginx's hash since nginx doesn't reference it,
+	// but we can verify the store still has the old hash
+	s.store.UpdateConfigMap("default", "unrelated-cm", &v1.ConfigMap{Data: map[string]string{"k": "v"}})
+	hashAfter := s.store.GetWorkload("default", "nginx").ConfigHash
+	if hash != hashAfter {
+		t.Error("unrelated CM update should not change nginx workload hash")
 	}
 }

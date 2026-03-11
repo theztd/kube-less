@@ -2,6 +2,8 @@ package cri
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -64,20 +66,40 @@ func BuildPodSandboxConfig(dep *appsv1.Deployment) *runtimeapi.PodSandboxConfig 
 }
 
 // BuildContainerConfigs translates the containers of a Deployment into CRI ContainerConfigs.
-// Literal env vars and configMapKeyRef / secretKeyRef are resolved.
-// Volume mounts (ConfigMap FS mount) are handled in Milestone C.
+// Resolves literal envs, configMapKeyRef, secretKeyRef, and ConfigMap volume mounts.
+// For volume mounts, ConfigMap data is written to <dataDir>/configmaps/<ns>/<cm-name>/
+// and mounted read-only into the container.
+// Pass dataDir="" to skip volume mount processing (e.g. in tests without disk access).
 func BuildContainerConfigs(
 	dep *appsv1.Deployment,
 	sbConfig *runtimeapi.PodSandboxConfig,
 	cms map[string]*v1.ConfigMap,
 	secrets map[string]*v1.Secret,
+	dataDir string,
 ) ([]*runtimeapi.ContainerConfig, error) {
-	var configs []*runtimeapi.ContainerConfig
+	// Pre-process pod-level volumes that back ConfigMaps:
+	// write files to the host and record the hostPath per volume name.
+	cmHostPaths, err := prepareConfigMapVolumes(dep, cms, dataDir)
+	if err != nil {
+		return nil, err
+	}
 
+	var configs []*runtimeapi.ContainerConfig
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		envs, err := resolveEnvs(dep.Namespace, c.Env, cms, secrets)
 		if err != nil {
 			return nil, fmt.Errorf("container %s: %w", c.Name, err)
+		}
+
+		var mounts []*runtimeapi.Mount
+		for _, vm := range c.VolumeMounts {
+			if hostPath, ok := cmHostPaths[vm.Name]; ok {
+				mounts = append(mounts, &runtimeapi.Mount{
+					HostPath:      hostPath,
+					ContainerPath: vm.MountPath,
+					Readonly:      true,
+				})
+			}
 		}
 
 		cfg := &runtimeapi.ContainerConfig{
@@ -89,6 +111,7 @@ func BuildContainerConfigs(
 			Command: c.Command,
 			Args:    c.Args,
 			Envs:    envs,
+			Mounts:  mounts,
 			Linux: &runtimeapi.LinuxContainerConfig{
 				SecurityContext: &runtimeapi.LinuxContainerSecurityContext{},
 			},
@@ -96,6 +119,58 @@ func BuildContainerConfigs(
 		configs = append(configs, cfg)
 	}
 	return configs, nil
+}
+
+// prepareConfigMapVolumes writes ConfigMap data to disk for all CM-backed volumes
+// and returns a map from volume name to host directory path.
+func prepareConfigMapVolumes(dep *appsv1.Deployment, cms map[string]*v1.ConfigMap, dataDir string) (map[string]string, error) {
+	hostPaths := make(map[string]string)
+	if dataDir == "" {
+		return hostPaths, nil
+	}
+
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.ConfigMap == nil {
+			continue
+		}
+		optional := vol.ConfigMap.Optional != nil && *vol.ConfigMap.Optional
+		cmKey := dep.Namespace + "/" + vol.ConfigMap.Name
+
+		var cmData map[string]string
+		if cms != nil {
+			if cm, ok := cms[cmKey]; ok {
+				cmData = cm.Data
+			}
+		}
+		if cmData == nil {
+			if optional {
+				continue
+			}
+			return nil, fmt.Errorf("volume %q: configMap %q not found in store", vol.Name, vol.ConfigMap.Name)
+		}
+
+		hostPath := filepath.Join(dataDir, "configmaps", dep.Namespace, vol.ConfigMap.Name)
+		if err := writeConfigMapFiles(hostPath, cmData); err != nil {
+			return nil, fmt.Errorf("volume %q: failed to write configmap files: %w", vol.Name, err)
+		}
+		hostPaths[vol.Name] = hostPath
+	}
+	return hostPaths, nil
+}
+
+// writeConfigMapFiles writes each key of the ConfigMap as a file under hostPath.
+// The directory is created with 0755 and files with 0644.
+func writeConfigMapFiles(hostPath string, data map[string]string) error {
+	if err := os.MkdirAll(hostPath, 0755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", hostPath, err)
+	}
+	for key, value := range data {
+		filePath := filepath.Join(hostPath, key)
+		if err := os.WriteFile(filePath, []byte(value), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", filePath, err)
+		}
+	}
+	return nil
 }
 
 // GetPullPolicy returns the image pull policy from the deployment annotation.

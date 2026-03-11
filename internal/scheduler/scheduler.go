@@ -10,6 +10,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"kube-less/internal/cri"
@@ -36,17 +37,19 @@ type CRIRuntime interface {
 
 // Scheduler orchestrates the lifecycle of pods based on manifests.
 type Scheduler struct {
-	store  *Store
-	client CRIRuntime
-	parser *parser.Parser
+	store   *Store
+	client  CRIRuntime
+	parser  *parser.Parser
+	dataDir string // root dir for ConfigMap host mounts
 }
 
 // NewScheduler creates a new Scheduler instance.
-func NewScheduler(store *Store, client *cri.Client, p *parser.Parser) *Scheduler {
+func NewScheduler(store *Store, client *cri.Client, p *parser.Parser, dataDir string) *Scheduler {
 	return &Scheduler{
-		store:  store,
-		client: client,
-		parser: p,
+		store:   store,
+		client:  client,
+		parser:  p,
+		dataDir: dataDir,
 	}
 }
 
@@ -156,7 +159,8 @@ func (s *Scheduler) LoadManifests(manifestDirs []string) error {
 }
 
 // loadManifestFile parses one YAML file and updates the store (desired state only,
-// no CRI calls). Mirrors the parse path of handleUpdate without the create pipeline.
+// no CRI calls). Routes Deployments, ConfigMaps and Secrets to the appropriate
+// store methods and records file→object mappings for cleanup on delete.
 func (s *Scheduler) loadManifestFile(filePath string) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -168,18 +172,33 @@ func (s *Scheduler) loadManifestFile(filePath string) {
 		log.Printf("LoadManifests: failed to parse %s: %v", filePath, err)
 		return
 	}
-	var keys []string
+	var workloadKeys, cmKeys, secretKeys []string
 	for _, obj := range objects {
-		dep, ok := obj.(*appsv1.Deployment)
-		if !ok {
-			continue
+		switch o := obj.(type) {
+		case *appsv1.Deployment:
+			s.store.UpdateWorkload(o.Namespace, o.Name, o)
+			workloadKeys = append(workloadKeys, keyFunc(o.Namespace, o.Name))
+		case *v1.ConfigMap:
+			s.store.UpdateConfigMap(o.Namespace, o.Name, o)
+			cmKeys = append(cmKeys, keyFunc(o.Namespace, o.Name))
+		case *v1.Secret:
+			s.store.UpdateSecret(o.Namespace, o.Name, o)
+			secretKeys = append(secretKeys, keyFunc(o.Namespace, o.Name))
 		}
-		s.store.UpdateWorkload(dep.Namespace, dep.Name, dep)
-		keys = append(keys, keyFunc(dep.Namespace, dep.Name))
 	}
-	if len(keys) > 0 {
-		s.store.SetFileWorkloads(filePath, keys)
-		log.Printf("LoadManifests: loaded %d workload(s) from %s", len(keys), filePath)
+	if len(workloadKeys) > 0 {
+		s.store.SetFileWorkloads(filePath, workloadKeys)
+	}
+	if len(cmKeys) > 0 {
+		s.store.SetFileCMs(filePath, cmKeys)
+	}
+	if len(secretKeys) > 0 {
+		s.store.SetFileSecrets(filePath, secretKeys)
+	}
+	total := len(workloadKeys) + len(cmKeys) + len(secretKeys)
+	if total > 0 {
+		log.Printf("LoadManifests: loaded %d object(s) from %s (deployments=%d, cms=%d, secrets=%d)",
+			total, filePath, len(workloadKeys), len(cmKeys), len(secretKeys))
 	}
 }
 
@@ -194,7 +213,9 @@ func (s *Scheduler) OnManifestEvent(event watcher.Event) {
 	}
 }
 
-// handleUpdate parses a manifest file and creates/recreates workloads as needed.
+// handleUpdate parses a manifest file and:
+//   - Routes ConfigMaps / Secrets to the store (triggers hash recomputation for affected workloads)
+//   - Creates / recreates Deployments as needed
 func (s *Scheduler) handleUpdate(filePath string) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -209,70 +230,120 @@ func (s *Scheduler) handleUpdate(filePath string) {
 	}
 
 	ctx := context.Background()
-	var workloadKeys []string
+	var workloadKeys, cmKeys, secretKeys []string
 
 	for _, obj := range objects {
-		dep, ok := obj.(*appsv1.Deployment)
-		if !ok {
-			continue
-		}
+		switch o := obj.(type) {
+		case *v1.ConfigMap:
+			s.store.UpdateConfigMap(o.Namespace, o.Name, o)
+			cmKeys = append(cmKeys, keyFunc(o.Namespace, o.Name))
+		case *v1.Secret:
+			s.store.UpdateSecret(o.Namespace, o.Name, o)
+			secretKeys = append(secretKeys, keyFunc(o.Namespace, o.Name))
+		case *appsv1.Deployment:
+			key := keyFunc(o.Namespace, o.Name)
+			workloadKeys = append(workloadKeys, key)
 
-		key := keyFunc(dep.Namespace, dep.Name)
-		workloadKeys = append(workloadKeys, key)
+			// UpdateWorkload recomputes ConfigHash (includes CM/Secret values)
+			existing := s.store.GetWorkload(o.Namespace, o.Name)
+			s.store.UpdateWorkload(o.Namespace, o.Name, o)
+			updated := s.store.GetWorkload(o.Namespace, o.Name)
 
-		newHash := ComputeConfigHash(dep)
-		existing := s.store.GetWorkload(dep.Namespace, dep.Name)
+			// No-op when running and effective hash unchanged
+			if existing != nil && existing.ConfigHash == updated.ConfigHash && existing.Status == PodStatusRunning {
+				log.Printf("handleUpdate: %s/%s unchanged, skipping", o.Namespace, o.Name)
+				continue
+			}
 
-		// No-op when already running with the same config
-		if existing != nil && existing.ConfigHash == newHash && existing.Status == PodStatusRunning {
-			log.Printf("handleUpdate: %s/%s unchanged, skipping", dep.Namespace, dep.Name)
-			s.store.UpdateWorkload(dep.Namespace, dep.Name, dep)
-			continue
-		}
+			if existing != nil && existing.PodSandboxID != "" {
+				log.Printf("handleUpdate: recreating %s/%s", o.Namespace, o.Name)
+				s.deleteWorkload(ctx, *existing)
+			}
 
-		// Tear down existing sandbox before creating a new one
-		if existing != nil && existing.PodSandboxID != "" {
-			log.Printf("handleUpdate: recreating %s/%s (hash changed)", dep.Namespace, dep.Name)
-			s.deleteWorkload(ctx, *existing)
-		}
-
-		s.store.UpdateWorkload(dep.Namespace, dep.Name, dep)
-
-		if err := s.createWorkload(ctx, dep); err != nil {
-			log.Printf("handleUpdate: failed to create %s/%s: %v", dep.Namespace, dep.Name, err)
+			if err := s.createWorkload(ctx, o); err != nil {
+				log.Printf("handleUpdate: failed to create %s/%s: %v", o.Namespace, o.Name, err)
+			}
 		}
 	}
 
 	if len(workloadKeys) > 0 {
 		s.store.SetFileWorkloads(filePath, workloadKeys)
 	}
+	if len(cmKeys) > 0 {
+		s.store.SetFileCMs(filePath, cmKeys)
+	}
+	if len(secretKeys) > 0 {
+		s.store.SetFileSecrets(filePath, secretKeys)
+	}
 }
 
-// handleRemove stops and removes all workloads that were loaded from the given file.
+// handleRemove tears down all workloads, ConfigMaps and Secrets that were loaded
+// from the given file, and cleans up any ConfigMap host directories.
 func (s *Scheduler) handleRemove(filePath string) {
-	keys := s.store.GetFileWorkloads(filePath)
-	if len(keys) == 0 {
-		log.Printf("handleRemove: no workloads known for %s", filePath)
-		return
-	}
-
 	ctx := context.Background()
-	for _, key := range keys {
+
+	// Remove workloads (Deployments)
+	for _, key := range s.store.GetFileWorkloads(filePath) {
 		parts := strings.SplitN(key, "/", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		namespace, name := parts[0], parts[1]
-
-		ws := s.store.GetWorkload(namespace, name)
-		if ws != nil {
+		ns, name := parts[0], parts[1]
+		if ws := s.store.GetWorkload(ns, name); ws != nil {
+			s.cleanupConfigMapFiles(ws.Manifest)
 			s.deleteWorkload(ctx, *ws)
 		}
-		s.store.DeleteWorkload(namespace, name)
-		log.Printf("handleRemove: deleted %s", key)
+		s.store.DeleteWorkload(ns, name)
+		log.Printf("handleRemove: deleted workload %s", key)
 	}
-
 	s.store.DeleteFileWorkloads(filePath)
+
+	// Remove ConfigMaps + clean up host dirs
+	for _, key := range s.store.GetFileCMs(filePath) {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ns, name := parts[0], parts[1]
+		if s.dataDir != "" {
+			dir := filepath.Join(s.dataDir, "configmaps", ns, name)
+			if err := os.RemoveAll(dir); err != nil {
+				log.Printf("handleRemove: failed to remove CM dir %s: %v", dir, err)
+			}
+		}
+		s.store.DeleteConfigMap(ns, name)
+		log.Printf("handleRemove: deleted configmap %s", key)
+	}
+	s.store.DeleteFileCMs(filePath)
+
+	// Remove Secrets
+	for _, key := range s.store.GetFileSecrets(filePath) {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ns, name := parts[0], parts[1]
+		s.store.DeleteSecret(ns, name)
+		log.Printf("handleRemove: deleted secret %s", key)
+	}
+	s.store.DeleteFileSecrets(filePath)
+}
+
+// cleanupConfigMapFiles removes host-side ConfigMap directories for volumes
+// declared in the deployment manifest.
+func (s *Scheduler) cleanupConfigMapFiles(dep *appsv1.Deployment) {
+	if dep == nil || s.dataDir == "" {
+		return
+	}
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.ConfigMap == nil {
+			continue
+		}
+		dir := filepath.Join(s.dataDir, "configmaps", dep.Namespace, vol.ConfigMap.Name)
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("cleanupConfigMapFiles: failed to remove %s: %v", dir, err)
+		}
+	}
 }
 
 // createWorkload pulls images and starts a new pod sandbox + containers.
@@ -289,9 +360,11 @@ func (s *Scheduler) createWorkload(ctx context.Context, dep *appsv1.Deployment) 
 	if sbConfig.Annotations == nil {
 		sbConfig.Annotations = make(map[string]string)
 	}
-	sbConfig.Annotations["kube-less/config-hash"] = ComputeConfigHash(dep)
+	// Use the effective hash (includes CM/Secret values) as the sandbox annotation
+	sbConfig.Annotations["kube-less/config-hash"] = computeEffectiveHashWithStore(dep, s.store)
 
-	containerConfigs, err := cri.BuildContainerConfigs(dep, sbConfig, nil, nil)
+	containerConfigs, err := cri.BuildContainerConfigs(dep, sbConfig,
+		s.store.GetAllConfigMaps(), s.store.GetAllSecrets(), s.dataDir)
 	if err != nil {
 		return err
 	}
@@ -323,7 +396,7 @@ func (s *Scheduler) createWorkload(ctx context.Context, dep *appsv1.Deployment) 
 		containerIDs = append(containerIDs, containerID)
 	}
 
-	s.store.SetWorkloadRuntime(dep.Namespace, dep.Name, sandboxID, containerIDs, sandboxIP, ComputeConfigHash(dep))
+	s.store.SetWorkloadRuntime(dep.Namespace, dep.Name, sandboxID, containerIDs, sandboxIP, computeEffectiveHashWithStore(dep, s.store))
 	log.Printf("createWorkload: %s/%s started (sandbox=%s, ip=%s)", dep.Namespace, dep.Name, sandboxID, sandboxIP)
 	return nil
 }
@@ -373,6 +446,12 @@ func (s *Scheduler) pullImageWithPolicy(ctx context.Context, dep *appsv1.Deploym
 		}
 		return nil
 	}
+}
+
+// computeEffectiveHashWithStore computes the config hash for a deployment
+// using the current CM and Secret values from the store.
+func computeEffectiveHashWithStore(dep *appsv1.Deployment, store *Store) string {
+	return computeEffectiveHash(dep, store.GetAllConfigMaps(), store.GetAllSecrets())
 }
 
 // SyncStateFromCRI reconciles the store (populated by LoadManifests) against the

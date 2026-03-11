@@ -74,7 +74,7 @@ func TestBuildContainerConfigs_LiteralEnv(t *testing.T) {
 	}
 
 	sbCfg := BuildPodSandboxConfig(dep)
-	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, nil)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestBuildContainerConfigs_ConfigMapRef(t *testing.T) {
 	}
 
 	sbCfg := BuildPodSandboxConfig(dep)
-	cfgs, err := BuildContainerConfigs(dep, sbCfg, cms, nil)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, cms, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestBuildContainerConfigs_SecretRef(t *testing.T) {
 	}
 
 	sbCfg := BuildPodSandboxConfig(dep)
-	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, secrets)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, secrets, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestBuildContainerConfigs_MissingConfigMap_Error(t *testing.T) {
 	}
 
 	sbCfg := BuildPodSandboxConfig(dep)
-	_, err := BuildContainerConfigs(dep, sbCfg, nil, nil)
+	_, err := BuildContainerConfigs(dep, sbCfg, nil, nil, "")
 	if err == nil {
 		t.Error("expected error for missing configmap")
 	}
@@ -187,7 +187,7 @@ func TestBuildContainerConfigs_OptionalMissingRef_Skipped(t *testing.T) {
 	}
 
 	sbCfg := BuildPodSandboxConfig(dep)
-	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, nil)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error for optional ref: %v", err)
 	}
@@ -210,6 +210,95 @@ func TestBuildPodSandboxConfig_PortMappings(t *testing.T) {
 	pm := sbCfg.PortMappings[0]
 	if pm.ContainerPort != 80 || pm.HostPort != 8080 {
 		t.Errorf("unexpected port mapping: %+v", pm)
+	}
+}
+
+// ── ConfigMap volume mounts ───────────────────────────────────────────────────
+
+func TestBuildContainerConfigs_VolumeMountFromConfigMap(t *testing.T) {
+	dep := baseDeployment()
+	dep.Spec.Template.Spec.Volumes = []v1.Volume{
+		{
+			Name: "config-vol",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{Name: "app-config"},
+				},
+			},
+		},
+	}
+	dep.Spec.Template.Spec.Containers[0].VolumeMounts = []v1.VolumeMount{
+		{Name: "config-vol", MountPath: "/etc/app"},
+	}
+
+	cms := map[string]*v1.ConfigMap{
+		"default/app-config": {
+			Data: map[string]string{"app.conf": "key=value"},
+		},
+	}
+
+	dataDir := t.TempDir()
+	sbCfg := BuildPodSandboxConfig(dep)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, cms, nil, dataDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfgs[0].Mounts) != 1 {
+		t.Fatalf("expected 1 mount, got %d", len(cfgs[0].Mounts))
+	}
+	mount := cfgs[0].Mounts[0]
+	if mount.ContainerPath != "/etc/app" {
+		t.Errorf("expected ContainerPath=/etc/app, got %s", mount.ContainerPath)
+	}
+	if !mount.Readonly {
+		t.Error("mount should be read-only")
+	}
+}
+
+func TestBuildContainerConfigs_MissingCMVolume_Error(t *testing.T) {
+	dep := baseDeployment()
+	dep.Spec.Template.Spec.Volumes = []v1.Volume{
+		{
+			Name: "missing-vol",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{Name: "missing-cm"},
+				},
+			},
+		},
+	}
+
+	dataDir := t.TempDir()
+	sbCfg := BuildPodSandboxConfig(dep)
+	_, err := BuildContainerConfigs(dep, sbCfg, nil, nil, dataDir)
+	if err == nil {
+		t.Error("expected error for missing required ConfigMap volume")
+	}
+}
+
+func TestBuildContainerConfigs_OptionalCMVolume_Skipped(t *testing.T) {
+	dep := baseDeployment()
+	optional := true
+	dep.Spec.Template.Spec.Volumes = []v1.Volume{
+		{
+			Name: "opt-vol",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{Name: "optional-cm"},
+					Optional:             &optional,
+				},
+			},
+		},
+	}
+
+	dataDir := t.TempDir()
+	sbCfg := BuildPodSandboxConfig(dep)
+	cfgs, err := BuildContainerConfigs(dep, sbCfg, nil, nil, dataDir)
+	if err != nil {
+		t.Fatalf("unexpected error for optional missing CM volume: %v", err)
+	}
+	if len(cfgs[0].Mounts) != 0 {
+		t.Errorf("expected 0 mounts for optional missing CM, got %d", len(cfgs[0].Mounts))
 	}
 }
 
