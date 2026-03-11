@@ -79,7 +79,8 @@ každých <sync_interval>:
     actual   = dotaz na CRI runtime (ListPodSandbox + ListContainers)
     diff     = compare(desired, actual)
     aplikuj diff (create / update / delete)
-              → pořadí: network namespace → bridge/iptables → cri sandbox → cri containers
+              → pořadí: cri sandbox → cri containers
+              (networking zajišťuje containerd+CNI automaticky při RunPodSandbox)
 ```
 
 `compare` vrátí jednu z akcí:
@@ -310,7 +311,53 @@ Pokud Deployment nemá definovanou `readinessProbe`:
 
 ---
 
-## 5. Architektura balíků
+## 5. Networking
+
+### 5.0 Zodpovědnosti
+
+Networking je plně delegován na **containerd + CNI**. kube-less runtime
+networking sám nezřizuje ani nekonfiguruje.
+
+| Zodpovědnost | Kdo |
+|---|---|
+| Instalace CNI binárky (`bridge`, `host-local`, `portmap`) | operátor / install skript |
+| Zápis CNI conflistu do `/etc/cni/net.d/` | operátor / install skript |
+| Vytvoření netns, bridge, přidělení IP | containerd (volá CNI při `RunPodSandbox`) |
+| Validace přítomnosti CNI při startu | kube-less (`network/cni.go`) |
+| Konfigurace subnetů pro cross-node routing | operátor (statické routy / BGP) |
+
+### 5.0.1 Konfigurace sítě v `config.yaml`
+
+```yaml
+network:
+  node_subnet: "10.88.0.0/16"       # subnet pro tento node; každý node musí mít unikátní subnet
+                                     # pro cross-node routing (např. node1: 10.88.0.0/24, node2: 10.88.1.0/24)
+  bridge_name: "kube-less0"          # název bridge interface (default: kube-less0)
+  cni_conf_dir: "/etc/cni/net.d"    # adresář s CNI konfiguračními soubory
+  cni_bin_dir:  "/opt/cni/bin"      # adresář s CNI binárkami
+```
+
+Hodnoty z `network` sekce slouží jako reference pro validaci a pro install skript –
+kube-less runtime je do CNI conflistu **nezapisuje**.
+
+### 5.0.2 Startup validace (`network/cni.go`)
+
+Při startu kube-less:
+1. Ověřit existenci `cni_conf_dir` a přítomnost alespoň jednoho `*.conflist` nebo `*.conf` souboru.
+2. Ověřit přítomnost binárky `bridge`, `host-local`, `portmap` v `cni_bin_dir`.
+3. Při chybě: vypsat srozumitelnou chybovou hlášku a ukončit proces s exit kódem 1.
+
+### 5.0.3 Cross-node networking
+
+Každý node má konfigurovaný jiný `node_subnet`. Routing mezi nody je
+zajišťován na úrovni infrastruktury (statické routy, BGP) – mimo scope kube-less.
+kube-less zajišťuje pouze to, že subnet je v CNI konflistu správně nastaven
+(přes install skript čtoucí `config.yaml`).
+
+---
+
+## 6. Architektura balíků
+
 
 ### 5.1 Datový tok
 
@@ -348,14 +395,19 @@ bez přidané vazby v opačném směru.
 ### 5.3 Pořadí operací (create)
 
 ```
-1. network namespace (izolace)
-2. bridge + iptables (síťová konektivita)
-3. cri.RunPodSandbox
-4. cri.CreateContainer + cri.StartContainer
+1. cri.RunPodSandbox  (containerd automaticky volá CNI plugin → vytvoří netns + bridge + IP)
+2. cri.CreateContainer + cri.StartContainer
 ```
 
-Teardown probíhá v obráceném pořadí. Toto řadí **scheduler**,
-nikoli balík `cri` – protože `cri` o `network` objektech neví.
+Teardown probíhá v obráceném pořadí. Networking (netns, bridge, iptables) je
+plně v zodpovědnosti containerd+CNI – kube-less ho neřídí.
+
+**Předpoklad:** CNI konfigurace (`/etc/cni/net.d/`) a CNI binárky (`/opt/cni/bin/`)
+jsou přítomny před spuštěním kube-less. Jejich instalace je zodpovědností
+operátora/instalačního procesu, nikoli kube-less runtime.
+
+kube-less při startu ověří přítomnost CNI konfigurace a binárky `bridge`,
+`host-local`, `portmap`. Při chybě vypíše chybu a odmítne nastartovat.
 
 ### 5.4 Přehled nových/změněných souborů
 
@@ -382,18 +434,18 @@ internal/
                         # +BuildPodSandboxConfig, +BuildContainerConfigs
                         #  (překlad Deployment → CRI config objekty)
   network/
-    bridge.go           # vytvoření/smazání Linux bridge
-    namespace.go        # network namespace + adresář s daty
-    iptables.go         # pravidla pro NAT / port-forward
+    cni.go              # validace CNI konfigurace a binárky při startu
   probe/
     runner.go           # ProbeRunner
     runner_test.go
   api/
     server.go           # +GET /endpoints
   config/
-    config.go           # +DataDir string
+    config.go           # +DataDir string, +Network NetworkConfig
 configs/
   config.yaml           # +data_dir: /var/lib/kube-less
+                        # +network.node_subnet, +network.bridge_name,
+                        # +network.cni_conf_dir, +network.cni_bin_dir
 ```
 
 > **Poznámka k přejmenování:** původní `internal/engine` → `internal/scheduler`,
@@ -403,16 +455,15 @@ configs/
 
 ---
 
-## 6. Pořadí implementace (milníky)
+## 7. Pořadí implementace (milníků)
 
 ### Milestone A – Základní create/delete (unblockuje vše ostatní)
 1. `cri/client.go` – přidat všechny chybějící CRI metody
 2. `cri/client.go` – BuildPodSandboxConfig + BuildContainerConfigs
    (bez ConfigMap injekcí, jen literální env a image)
-3. `network/` – bridge, namespace, iptables (základní implementace)
+3. `network/cni.go` – validace CNI konfigurace a binárky při startu
 4. `scheduler/scheduler.go` – handleUpdate: orchestrace create pipeline
-   (network namespace → bridge/iptables → PullImage → RunPodSandbox →
-   CreateContainer → StartContainer)
+   (PullImage → RunPodSandbox → CreateContainer → StartContainer)
 5. `scheduler/scheduler.go` – handleRemove: orchestrace delete pipeline
    (teardown v obráceném pořadí)
 
@@ -444,7 +495,7 @@ configs/
 
 ---
 
-## 7. Otevřené otázky a rozhodnutí
+## 8. Otevřené otázky a rozhodnutí
 
 | Otázka | Rozhodnutí pro 0.1.0 |
 |---|---|
@@ -455,3 +506,4 @@ configs/
 | Secrets v paměti | Ukládat jen na dobu hydration, neperzistovat na disk v plaintextu |
 | Liveness probe | Není v scope 0.1.0, přidáme v 0.2.0 |
 | Port v endpoint bez readiness probe | Přidat ihned po StartContainer s optimistickým Ready=true |
+| `kube-less check` subcommand | Není v scope 0.1.0; v budoucnu: ověří přítomnost CNI binárky + CNI konfig, provede dry-run parsování všech manifestů v `manifest_dirs` a skončí s exit kódem 0/1 |
