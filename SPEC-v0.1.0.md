@@ -457,41 +457,60 @@ configs/
 
 ## 7. Pořadí implementace (milníků)
 
-### Milestone A – Základní create/delete (unblockuje vše ostatní)
-1. `cri/client.go` – přidat všechny chybějící CRI metody
-2. `cri/client.go` – BuildPodSandboxConfig + BuildContainerConfigs
-   (bez ConfigMap injekcí, jen literální env a image)
-3. `network/cni.go` – validace CNI konfigurace a binárky při startu
-4. `scheduler/scheduler.go` – handleUpdate: orchestrace create pipeline
-   (PullImage → RunPodSandbox → CreateContainer → StartContainer)
-5. `scheduler/scheduler.go` – handleRemove: orchestrace delete pipeline
-   (teardown v obráceném pořadí)
+### ✅ Milestone A – Základní create/delete
+1. ✅ `cri/client.go` – přidány všechny chybějící CRI metody
+   (`RunPodSandbox`, `StopPodSandbox`, `RemovePodSandbox`, `PodSandboxStatus`,
+   `ListContainers`, `CreateContainer`, `StartContainer`, `StopContainer`,
+   `RemoveContainer`, `PullImage`, `ImageStatus`)
+2. ✅ `cri/builder.go` – `BuildPodSandboxConfig` + `BuildContainerConfigs`
+   (literální env, `configMapKeyRef`, `secretKeyRef`, port mappings na sandbox úrovni)
+   + `GetPullPolicy` (`kube-less.io/pull-policy` anotace)
+3. ✅ `network/cni.go` – `ValidateCNI`: ověří conflist/conf soubory + binárky
+   (`bridge`, `host-local`, `portmap`) při startu; chyba → exit 1
+4. ✅ `scheduler/scheduler.go` – `handleUpdate`: plný create pipeline
+   (PullImage dle pull-policy → RunPodSandbox → CreateContainer → StartContainer)
+5. ✅ `scheduler/scheduler.go` – `handleRemove`: teardown přes `fileToWorkloads`
+   (StopContainer + RemoveContainer → StopPodSandbox + RemovePodSandbox)
+6. ✅ `scheduler/reconciler.go` – `Action` typ + `compare()` (None/Create/Recreate/Delete)
+7. ✅ `scheduler/store.go` – rozšíření `WorkloadState` o `ContainerIDs`, `SandboxIP`,
+   `ConfigHash`, `StartedAt`; Store o `fileToWorkloads`
+8. ✅ Testy: `cri/builder_test.go` (11), `network/cni_test.go` (6),
+   `scheduler/reconciler_test.go` (5), `scheduler/store_test.go` (+9),
+   `config/config_test.go` (11), `api/server_test.go` (5)
 
-### Milestone B – Reconciliace a odolnost vůči restartu
-6. `scheduler/store.go` – fileToWorkloads, ConfigHash, ContainerIDs, SandboxIP,
-   StartedAt
-7. `scheduler/reconciler.go` – compare() + applyDiff()
-   (actual state = pull z CRI, ne push od CRI)
-8. `scheduler/scheduler.go` – plná StartReconciliationLoop
-9. Startup reconciliation (načtení souborů → sync s CRI před spuštěním Watcheru)
+### ✅ Milestone B – Reconciliace a odolnost vůči restartu
+9. ✅ `scheduler/store.go` – `UpdateWorkload` automaticky počítá `ConfigHash`
+   (desired hash); nová `UpdateRuntimeStatus` (nezapisuje ConfigHash)
+10. ✅ `scheduler/scheduler.go` – `LoadManifests`: synchronní načtení všech YAML
+    před startem watcheru; `loadManifestFile` (desired state only, bez CRI)
+11. ✅ `scheduler/scheduler.go` – `SyncStateFromCRI`: fetchuje `ContainerIDs`
+    (`ListContainers`), `SandboxIP` (`PodSandboxStatus`), odstraní osiřelé sandboxy;
+    zachová desired `ConfigHash`
+12. ✅ `scheduler/scheduler.go` – `reconcileAll`: periodický diff (desired vs. actual
+    CRI), nil-guard pro `ws.Manifest`; `StartReconciliationLoop` plně funkční
+13. ✅ `createWorkload`: stampuje `kube-less/config-hash` jako sandbox anotaci
+14. ✅ `main.go` – správná startup sekvence: CNI validace → `LoadManifests` →
+    `SyncStateFromCRI` → `StartReconciliationLoop` → watcher
+15. ✅ Testy: `scheduler/scheduler_test.go` (14 testů – mock CRI)
 
 ### Milestone C – ConfigMap a Secret injekce
-10. `scheduler/store.go` – configMaps, secrets maps
-11. `parser/parser.go` – routování ConfigMap/Secret při parsování
-12. `cri/client.go` – BuildContainerConfigs: env reference (configMapKeyRef, secretKeyRef)
-13. `cri/client.go` – BuildContainerConfigs: FS mount (zápis na hostPath)
-14. Cleanup hostPath souborů při smazání CM / Deploymetu
+16. `scheduler/store.go` – přidat `configMaps`, `secrets` maps
+17. `scheduler/scheduler.go` / `parser` – routování `ConfigMap`/`Secret` při parsování
+    do store (oddělit od Deployment pipeline)
+18. `cri/builder.go` – `BuildContainerConfigs`: FS mount (zápis souborů na `data_dir/configmaps/`)
+19. `scheduler/scheduler.go` – cleanup hostPath souborů při smazání CM / Deploymetu
+20. Re-reconciliation Deploymentů při změně CM/Secret (přepočítat hash)
 
 ### Milestone D – HTTP sondy a endpoints API
-15. `scheduler/store.go` – Ready bool, ReadyContainers int
-16. `probe/runner.go` – ProbeRunner s HTTP GET sondou
-17. Integrace ProbeRunneru do main.go
-18. `api/server.go` – GET /endpoints
+21. `scheduler/store.go` – `Ready bool`, `ReadyContainers int`
+22. `probe/runner.go` – `ProbeRunner` s HTTP GET sondou
+    (`initialDelaySeconds`, `periodSeconds`, `failureThreshold`, `successThreshold`)
+23. Integrace `ProbeRunneru` do `main.go`
+24. `api/server.go` – `GET /endpoints`
 
 ### Milestone E – Finalizace
-19. `config/config.go` – DataDir
-20. Testy pro cri a probe balíky
-21. Aktualizace README a examples/manifests (přidat readinessProbe ukázku)
+25. Testy pro `probe` balík
+26. Aktualizace `examples/manifests` (přidat `readinessProbe` ukázku)
 
 ---
 
