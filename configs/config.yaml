@@ -8,10 +8,21 @@ manifest_dirs:
 # Common paths:
 #   containerd: unix:///run/containerd/containerd.sock
 #   CRI-O:      unix:///var/run/crio/crio.sock
-cri_socket_path: "unix:///Users/marek/.colima/default/containerd.sock"
+cri_socket_path: "unix:///run/containerd/containerd.sock"
 
 # Reconciliation loop interval
 sync_interval: "5s"
 
 # Debug API Port
 debug_api_port: 8080
+
+# Root directory for kube-less runtime data (ConfigMap host mounts, etc.)
+data_dir: /var/lib/kube-less
+
+# Networking – values used for startup validation and the install script.
+# kube-less does NOT configure networking; containerd + CNI handle it.
+network:
+  node_subnet: "10.88.0.0/24"   # unique per node in multi-node setups
+  bridge_name: "kube-less0"
+  cni_conf_dir: "/etc/cni/net.d"
+  cni_bin_dir:  "/opt/cni/bin"

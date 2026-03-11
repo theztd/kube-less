@@ -8,6 +8,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// NetworkConfig holds CNI and network settings.
+// kube-less does not configure networking itself – these values are used for
+// startup validation and as reference for the install script.
+type NetworkConfig struct {
+	// NodeSubnet is the IP subnet allocated to this node (e.g. "10.88.0.0/24").
+	// Each node in a multi-node setup must use a unique subnet.
+	NodeSubnet string `yaml:"node_subnet"`
+
+	// BridgeName is the Linux bridge interface name (default: kube-less0).
+	BridgeName string `yaml:"bridge_name"`
+
+	// CNIConfDir is the directory containing CNI conflist/conf files.
+	// Default: /etc/cni/net.d
+	CNIConfDir string `yaml:"cni_conf_dir"`
+
+	// CNIBinDir is the directory containing CNI plugin binaries.
+	// Default: /opt/cni/bin
+	CNIBinDir string `yaml:"cni_bin_dir"`
+}
+
 // Config represents the application configuration.
 type Config struct {
 	// ManifestDirs is a list of directories containing Kubernetes manifests.
@@ -24,6 +44,13 @@ type Config struct {
 	// DebugAPIPort is the port for the debug API server.
 	// Defaults to 8080 if not set.
 	DebugAPIPort int `yaml:"debug_api_port"`
+
+	// DataDir is the root directory for kube-less runtime data (ConfigMap files, etc.).
+	// Default: /var/lib/kube-less
+	DataDir string `yaml:"data_dir"`
+
+	// Network holds CNI / networking configuration.
+	Network NetworkConfig `yaml:"network"`
 }
 
 // Load reads the configuration from the specified file path.
@@ -53,6 +80,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.DebugAPIPort == 0 {
 		cfg.DebugAPIPort = 8080
+	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = "/var/lib/kube-less"
+	}
+	if cfg.Network.BridgeName == "" {
+		cfg.Network.BridgeName = "kube-less0"
+	}
+	if cfg.Network.CNIConfDir == "" {
+		cfg.Network.CNIConfDir = "/etc/cni/net.d"
+	}
+	if cfg.Network.CNIBinDir == "" {
+		cfg.Network.CNIBinDir = "/opt/cni/bin"
 	}
 
 	return cfg, nil

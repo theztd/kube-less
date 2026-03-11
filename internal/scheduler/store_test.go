@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -148,5 +149,103 @@ func TestKeyFunc_CorrectFormat(t *testing.T) {
 	expected := "production/api-server"
 	if key != expected {
 		t.Errorf("expected key %q, got %q", expected, key)
+	}
+}
+
+func TestGetWorkload_ReturnsNilForMissing(t *testing.T) {
+	s := NewStore()
+	if ws := s.GetWorkload("default", "missing"); ws != nil {
+		t.Errorf("expected nil, got %+v", ws)
+	}
+}
+
+func TestGetWorkload_ReturnsCopy(t *testing.T) {
+	s := NewStore()
+	s.UpdateWorkload("default", "nginx", makeDeployment("default", "nginx"))
+
+	ws := s.GetWorkload("default", "nginx")
+	ws.Name = "mutated"
+
+	fresh := s.GetWorkload("default", "nginx")
+	if fresh.Name != "nginx" {
+		t.Error("GetWorkload should return a copy, original should not be mutated")
+	}
+}
+
+func TestSetWorkloadRuntime(t *testing.T) {
+	s := NewStore()
+	s.UpdateWorkload("default", "nginx", makeDeployment("default", "nginx"))
+	s.SetWorkloadRuntime("default", "nginx", "sandbox-1", []string{"ctr-a", "ctr-b"}, "10.88.0.5", "hash-abc")
+
+	ws := s.GetWorkload("default", "nginx")
+	if ws.PodSandboxID != "sandbox-1" {
+		t.Errorf("expected sandbox-1, got %s", ws.PodSandboxID)
+	}
+	if len(ws.ContainerIDs) != 2 {
+		t.Errorf("expected 2 container IDs, got %d", len(ws.ContainerIDs))
+	}
+	if ws.SandboxIP != "10.88.0.5" {
+		t.Errorf("expected 10.88.0.5, got %s", ws.SandboxIP)
+	}
+	if ws.ConfigHash != "hash-abc" {
+		t.Errorf("expected hash-abc, got %s", ws.ConfigHash)
+	}
+	if ws.Status != PodStatusRunning {
+		t.Errorf("expected Running, got %s", ws.Status)
+	}
+	if ws.StartedAt.IsZero() {
+		t.Error("StartedAt should be set")
+	}
+}
+
+func TestFileWorkloads_SetGetDelete(t *testing.T) {
+	s := NewStore()
+	s.SetFileWorkloads("/manifests/app.yaml", []string{"default/nginx", "default/redis"})
+
+	keys := s.GetFileWorkloads("/manifests/app.yaml")
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+	if keys[0] != "default/nginx" || keys[1] != "default/redis" {
+		t.Errorf("unexpected keys: %v", keys)
+	}
+
+	s.DeleteFileWorkloads("/manifests/app.yaml")
+	if k := s.GetFileWorkloads("/manifests/app.yaml"); len(k) != 0 {
+		t.Errorf("expected empty after delete, got %v", k)
+	}
+}
+
+func TestFileWorkloads_GetReturnsCopy(t *testing.T) {
+	s := NewStore()
+	s.SetFileWorkloads("/manifests/app.yaml", []string{"default/nginx"})
+
+	keys := s.GetFileWorkloads("/manifests/app.yaml")
+	keys[0] = "mutated"
+
+	fresh := s.GetFileWorkloads("/manifests/app.yaml")
+	if fresh[0] != "default/nginx" {
+		t.Error("GetFileWorkloads should return a copy")
+	}
+}
+
+func TestComputeConfigHash_Deterministic(t *testing.T) {
+	dep := makeDeployment("default", "nginx")
+	h1 := ComputeConfigHash(dep)
+	h2 := ComputeConfigHash(dep)
+	if h1 != h2 {
+		t.Error("ComputeConfigHash should be deterministic")
+	}
+}
+
+func TestComputeConfigHash_DifferentSpec(t *testing.T) {
+	dep1 := makeDeployment("default", "nginx")
+	dep2 := makeDeployment("default", "nginx")
+	dep2.Spec.Template.Spec.Containers = []v1.Container{
+		{Name: "nginx", Image: "nginx:1.25"},
+	}
+
+	if ComputeConfigHash(dep1) == ComputeConfigHash(dep2) {
+		t.Error("different specs should produce different hashes")
 	}
 }
