@@ -398,6 +398,36 @@ func TestUpdateSecret_RecomputesWorkloadHash(t *testing.T) {
 
 // ── File → CM/Secret mapping tests ───────────────────────────────────────────
 
+func TestSetWorkloadReady_SetsReadyAndContainerCount(t *testing.T) {
+	s := NewStore()
+	s.UpdateWorkload("default", "nginx", makeDeployment("default", "nginx"))
+	s.SetWorkloadRuntime("default", "nginx", "sb-1", []string{"ctr-a", "ctr-b"}, "10.0.0.1", "hash")
+
+	s.SetWorkloadReady("default", "nginx", true)
+	ws := s.GetWorkload("default", "nginx")
+	if !ws.Ready {
+		t.Error("expected Ready=true")
+	}
+	if ws.ReadyContainers != 2 {
+		t.Errorf("expected ReadyContainers=2, got %d", ws.ReadyContainers)
+	}
+
+	s.SetWorkloadReady("default", "nginx", false)
+	ws = s.GetWorkload("default", "nginx")
+	if ws.Ready {
+		t.Error("expected Ready=false after setting not-ready")
+	}
+	if ws.ReadyContainers != 0 {
+		t.Errorf("expected ReadyContainers=0 when not ready, got %d", ws.ReadyContainers)
+	}
+}
+
+func TestSetWorkloadReady_NoopForMissing(t *testing.T) {
+	s := NewStore()
+	// Should not panic
+	s.SetWorkloadReady("default", "ghost", true)
+}
+
 func TestFileCMs_SetGetDelete(t *testing.T) {
 	s := NewStore()
 	s.SetFileCMs("/manifests/config.yaml", []string{"default/cm1", "default/cm2"})

@@ -14,6 +14,7 @@ import (
 	"kube-less/internal/cri"
 	"kube-less/internal/network"
 	"kube-less/internal/parser"
+	"kube-less/internal/probe"
 	"kube-less/internal/scheduler"
 	"kube-less/internal/watcher"
 )
@@ -56,9 +57,11 @@ func main() {
 		log.Fatalf("Failed to connect to CRI runtime: %v", err)
 	}
 
-	// Initialize Store and Scheduler
+	// Initialize Store, Scheduler and ProbeRunner
 	store := scheduler.NewStore()
 	sched := scheduler.NewScheduler(store, criClient, p, cfg.DataDir)
+	probeRunner := probe.NewRunner(store)
+	sched.SetProbeRunner(probeRunner)
 
 	// ── Startup sequence (spec §2.2) ──────────────────────────────────────────
 	// 1. Load all manifests from disk → populate desired state in Store

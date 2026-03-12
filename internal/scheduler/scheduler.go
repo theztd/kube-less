@@ -15,6 +15,7 @@ import (
 
 	"kube-less/internal/cri"
 	"kube-less/internal/parser"
+	"kube-less/internal/probe"
 	"kube-less/internal/watcher"
 )
 
@@ -37,10 +38,11 @@ type CRIRuntime interface {
 
 // Scheduler orchestrates the lifecycle of pods based on manifests.
 type Scheduler struct {
-	store   *Store
-	client  CRIRuntime
-	parser  *parser.Parser
-	dataDir string // root dir for ConfigMap host mounts
+	store       *Store
+	client      CRIRuntime
+	parser      *parser.Parser
+	dataDir     string       // root dir for ConfigMap host mounts
+	probeRunner *probe.Runner // may be nil (tests)
 }
 
 // NewScheduler creates a new Scheduler instance.
@@ -51,6 +53,11 @@ func NewScheduler(store *Store, client *cri.Client, p *parser.Parser, dataDir st
 		parser:  p,
 		dataDir: dataDir,
 	}
+}
+
+// SetProbeRunner attaches a probe runner used to start/stop HTTP readiness probes.
+func (s *Scheduler) SetProbeRunner(pr *probe.Runner) {
+	s.probeRunner = pr
 }
 
 // StartReconciliationLoop starts a periodic reconciliation loop.
@@ -398,11 +405,18 @@ func (s *Scheduler) createWorkload(ctx context.Context, dep *appsv1.Deployment) 
 
 	s.store.SetWorkloadRuntime(dep.Namespace, dep.Name, sandboxID, containerIDs, sandboxIP, computeEffectiveHashWithStore(dep, s.store))
 	log.Printf("createWorkload: %s/%s started (sandbox=%s, ip=%s)", dep.Namespace, dep.Name, sandboxID, sandboxIP)
+
+	if s.probeRunner != nil {
+		s.probeRunner.Watch(dep, sandboxIP)
+	}
 	return nil
 }
 
 // deleteWorkload stops and removes all containers and the sandbox for a workload.
 func (s *Scheduler) deleteWorkload(ctx context.Context, ws WorkloadState) {
+	if s.probeRunner != nil {
+		s.probeRunner.Stop(ws.Namespace, ws.Name)
+	}
 	for _, cid := range ws.ContainerIDs {
 		if err := s.client.StopContainer(ctx, cid, 10); err != nil {
 			log.Printf("deleteWorkload: failed to stop container %s: %v", cid, err)
@@ -506,6 +520,10 @@ func (s *Scheduler) SyncStateFromCRI(ctx context.Context) error {
 
 		s.store.UpdateRuntimeStatus(ws.Namespace, ws.Name, sb.Id, containerIDs, sandboxIP, TranslateCRIState(sb.State))
 		log.Printf("SyncStateFromCRI: %s/%s matched sandbox %s (ip=%s, containers=%d)", ws.Namespace, ws.Name, sb.Id, sandboxIP, len(containerIDs))
+
+		if s.probeRunner != nil && ws.Manifest != nil {
+			s.probeRunner.Watch(ws.Manifest, sandboxIP)
+		}
 		delete(runningByKey, key)
 	}
 

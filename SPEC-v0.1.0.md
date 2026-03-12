@@ -509,16 +509,23 @@ configs/
     (+3 testy: volume mount, missing CM error, optional CM skip), `scheduler_test.go`
     (+5 testů: LoadManifests CM/Secret, hash change detection)
 
-### Milestone D – HTTP sondy a endpoints API
-21. `scheduler/store.go` – `Ready bool`, `ReadyContainers int`
-22. `probe/runner.go` – `ProbeRunner` s HTTP GET sondou
-    (`initialDelaySeconds`, `periodSeconds`, `failureThreshold`, `successThreshold`)
-23. Integrace `ProbeRunneru` do `main.go`
-24. `api/server.go` – `GET /endpoints`
+### Milestone D – HTTP sondy a endpoints API ✅
+22. ✅ `scheduler/store.go` – přidány `Ready bool`, `ReadyContainers int` do `WorkloadState`;
+    metoda `SetWorkloadReady(namespace, name string, ready bool)`
+23. ✅ `probe/runner.go` – `Runner` s HTTP GET sondou; spravuje goroutiny per-workload;
+    respektuje `initialDelaySeconds`, `periodSeconds`, `successThreshold`, `failureThreshold`;
+    workloady bez readinessProbe označeny optimisticky Ready=true
+24. ✅ Integrace do `scheduler.go` – `SetProbeRunner()`; `createWorkload` volá `Watch`,
+    `deleteWorkload` volá `Stop`; `SyncStateFromCRI` obnoví Watch pro already-running workloady
+25. ✅ `api/server.go` – `GET /endpoints` vrací `[]Endpoint{namespace, name, ip, ports}`
+    pouze pro workloady kde `Ready=true && SandboxIP != ""`
+26. ✅ Propojení v `main.go` – `probe.NewRunner(store)` + `sched.SetProbeRunner(probeRunner)`
+27. ✅ Testy: `probe/runner_test.go` (7 testů: no-probe ready, HTTP success, HTTP failure 500,
+    Stop, resolvePort), `api/server_test.go` (+4 testy: /endpoints empty, ready workload,
+    filter logic, 405), `scheduler/store_test.go` (+2 testy: SetWorkloadReady, noop for missing)
 
 ### Milestone E – Finalizace
-25. Testy pro `probe` balík
-26. Aktualizace `examples/manifests` (přidat `readinessProbe` ukázku)
+28. Aktualizace `examples/manifests` (přidat `readinessProbe` ukázku)
 
 ---
 

@@ -24,16 +24,18 @@ const (
 
 // WorkloadState represents the desired and actual state of a single workload.
 type WorkloadState struct {
-	Name         string             `json:"name"`
-	Namespace    string             `json:"namespace"`
-	Manifest     *appsv1.Deployment `json:"-"`
-	PodSandboxID string             `json:"pod_sandbox_id,omitempty"`
-	ContainerIDs []string           `json:"container_ids,omitempty"`
-	SandboxIP    string             `json:"sandbox_ip,omitempty"`
-	ConfigHash   string             `json:"config_hash,omitempty"`
-	StartedAt    time.Time          `json:"started_at,omitempty"`
-	Status       PodStatus          `json:"status"`
-	LastUpdated  time.Time          `json:"last_updated"`
+	Name            string             `json:"name"`
+	Namespace       string             `json:"namespace"`
+	Manifest        *appsv1.Deployment `json:"-"`
+	PodSandboxID    string             `json:"pod_sandbox_id,omitempty"`
+	ContainerIDs    []string           `json:"container_ids,omitempty"`
+	SandboxIP       string             `json:"sandbox_ip,omitempty"`
+	ConfigHash      string             `json:"config_hash,omitempty"`
+	StartedAt       time.Time          `json:"started_at,omitempty"`
+	Status          PodStatus          `json:"status"`
+	Ready           bool               `json:"ready"`
+	ReadyContainers int                `json:"ready_containers"`
+	LastUpdated     time.Time          `json:"last_updated"`
 }
 
 // Store is a thread-safe in-memory store for workload desired/actual state,
@@ -156,6 +158,23 @@ func (s *Store) GetWorkloads() []*WorkloadState {
 		result = append(result, &copy)
 	}
 	return result
+}
+
+// SetWorkloadReady updates the readiness state of a workload.
+func (s *Store) SetWorkloadReady(namespace, name string, ready bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := keyFunc(namespace, name)
+	if state, exists := s.workloads[key]; exists {
+		state.Ready = ready
+		if ready {
+			state.ReadyContainers = len(state.ContainerIDs)
+		} else {
+			state.ReadyContainers = 0
+		}
+		state.LastUpdated = time.Now()
+	}
 }
 
 // DeleteWorkload removes a workload from the store.
