@@ -10,6 +10,7 @@ const (
 	ActionDelete                 // workload removed from store, delete sandbox
 )
 
+// String returns a human-readable name of the action.
 func (a Action) String() string {
 	switch a {
 	case ActionCreate:

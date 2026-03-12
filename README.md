@@ -8,7 +8,8 @@ K8s manifest runner without kubernetes :-)
 - **Watcher:** Monitors a local directory for YAML changes.
 - **Engine:** Maintains the desired state and orchestrates the reconciliation.
 - **CRI Client:** Communicates directly with the Container Runtime Interface.
-- **API:** Provides a simple status endpoint for debugging.
+- **Probe Runner:** Runs per-workload HTTP GET readiness probes; marks workloads ready/not-ready.
+- **API:** Provides HTTP endpoints for debugging (`/status`, `/endpoints`).
 
 ## Installation on Linux
 
@@ -178,11 +179,41 @@ go run cmd/kube-less/main.go -config configs/config.yaml
 
 ### Debugging
 
-Check the status of managed workloads:
+Check the status of all managed workloads:
 
 ```bash
 curl localhost:8080/status
 ```
+
+List only **ready** workloads with their IPs and container ports:
+
+```bash
+curl localhost:8080/endpoints
+# Example response:
+# [{"namespace":"default","name":"nginx","ip":"10.88.0.5","ports":[80]}]
+```
+
+---
+
+## Readiness Probes
+
+kube-less supports Kubernetes-style HTTP readiness probes. Add a `readinessProbe` to any container:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080        # integer or named port (e.g. "http")
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  successThreshold: 1
+  failureThreshold: 3
+```
+
+- Workloads **without** a readinessProbe are marked ready immediately after the container starts.
+- A workload appears in `/endpoints` only when `ready=true` and a sandbox IP is assigned.
+
+See `examples/manifests/nginx-example.yaml` for a full working example with ConfigMap, Secret, volume mount and readinessProbe.
 
 ---
 

@@ -1,26 +1,74 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: test-deployment
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: test
-  template:
-    metadata:
-      labels:
-        app: test
-    spec:
-      containers:
-      - name: test-container
-        image: busybox
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: test-config
+  name: nginx-config
   namespace: default
 data:
-  key: value
+  default.conf: |
+    server {
+      listen 80;
+      location /healthz { return 200 "ok\n"; }
+    }
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nginx-secret
+  namespace: default
+data:
+  # echo -n "supersecret" | base64
+  api_key: c3VwZXJzZWNyZXQ=
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: default
+  annotations:
+    # Pull policy: always | never | ifnotpresent (default)
+    kube-less.io/pull-policy: ifnotpresent
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - name: http
+              containerPort: 80
+              hostPort: 8080
+          env:
+            - name: APP_ENV
+              value: production
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nginx-secret
+                  key: api_key
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: nginx-config

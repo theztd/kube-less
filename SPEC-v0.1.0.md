@@ -524,8 +524,13 @@ configs/
     Stop, resolvePort), `api/server_test.go` (+4 testy: /endpoints empty, ready workload,
     filter logic, 405), `scheduler/store_test.go` (+2 testy: SetWorkloadReady, noop for missing)
 
-### Milestone E – Finalizace
-28. Aktualizace `examples/manifests` (přidat `readinessProbe` ukázku)
+### Milestone E – Finalizace ✅
+28. ✅ `examples/manifests/nginx-example.yaml` – kompletní příklad: ConfigMap, Secret,
+    volume mount, env refs, `readinessProbe.httpGet` s named portem
+29. ✅ Doc komentáře doplněny na všechny exportované metody (file→workload/CM/Secret mappings,
+    `Action.String()`)
+30. ✅ `README.md` – doplněna sekce Readiness Probes, `/endpoints` API, aktualizována
+    architektura (Probe Runner), odkaz na ukázkový manifest
 
 ---
 
