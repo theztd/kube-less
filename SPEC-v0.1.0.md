@@ -532,6 +532,18 @@ configs/
 30. ✅ `README.md` – doplněna sekce Readiness Probes, `/endpoints` API, aktualizována
     architektura (Probe Runner), odkaz na ukázkový manifest
 
+### Milestone F – Developer Experience & Release Pipeline ✅
+31. ✅ `Makefile` – targety: `build`, `test` (s race detectorem), `vet`, `lint`, `dist`,
+    `fmt`, `docs`, `clean`, `help`; `VERSION`/`COMMIT`/`BUILD_DATE` předány jako `-ldflags`
+32. ✅ `.github/workflows/ci.yml` – GitHub Actions CI: vet + test + build na každém push/PR
+33. ✅ `.github/workflows/release.yml` – GitHub Actions release: GoReleaser na tag `v*`
+34. ✅ `.goreleaser.yml` – multi-arch binárky (linux/amd64 + linux/arm64), tar.gz archivy,
+    checksumy, changelog filtr
+35. ✅ `scripts/prerelease.sh` – generuje `docs/GODOC.md` z `go doc -all` per-package;
+    dependency-free, spouštěn přes `make docs`
+36. ✅ `doc.go` package-level komentáře: `scheduler`, `cri`, `probe`, `api`, `network`
+37. ✅ `CHANGELOG.md` – Keep a Changelog formát, sekce v0.1.0 s milníky A–F a known limitations
+
 ---
 
 ## 8. Otevřené otázky a rozhodnutí
