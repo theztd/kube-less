@@ -1,3 +1,12 @@
+// Package probe runs per-workload HTTP GET readiness probes.
+//
+// Runner manages a goroutine per workload that periodically sends HTTP GET
+// requests to the probe endpoint (resolved from the sandbox IP and the
+// container port). It honours initialDelaySeconds, periodSeconds,
+// successThreshold and failureThreshold from the Kubernetes readinessProbe
+// spec. When a threshold is crossed, it calls ReadyUpdater.SetWorkloadReady to
+// update the scheduler Store. Workloads without a readinessProbe are marked
+// ready immediately after sandbox creation.
 package probe
 
 import (
@@ -13,7 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// ReadyUpdater is implemented by the store and called when readiness changes.
+// ReadyUpdater is implemented by *scheduler.Store. Defined here to avoid an
+// import cycle between the probe and scheduler packages.
 type ReadyUpdater interface {
 	SetWorkloadReady(namespace, name string, ready bool)
 }
@@ -26,7 +36,7 @@ type Runner struct {
 	client  *http.Client
 }
 
-// NewRunner creates a new probe Runner.
+// NewRunner creates a new Runner backed by the given ReadyUpdater.
 func NewRunner(store ReadyUpdater) *Runner {
 	return &Runner{
 		store:   store,
@@ -35,35 +45,53 @@ func NewRunner(store ReadyUpdater) *Runner {
 	}
 }
 
-// Watch starts probe goroutines for containers that declare a readinessProbe.HTTPGet.
-// Workloads with no readiness probe are marked ready immediately (optimistic).
+// Watch starts a readiness probe goroutine for the given deployment and
+// sandbox IP. If the deployment has no readinessProbe, the workload is
+// marked ready immediately without starting a goroutine.
+// Any previously running probe for the same workload is cancelled first.
 func (r *Runner) Watch(dep *appsv1.Deployment, sandboxIP string) {
-	ns, name := dep.Namespace, dep.Name
-	key := keyFor(ns, name)
+	key := dep.Namespace + "/" + dep.Name
 
 	r.mu.Lock()
 	if cancel, ok := r.cancels[key]; ok {
 		cancel()
+		delete(r.cancels, key)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	r.cancels[key] = cancel
 	r.mu.Unlock()
 
+	// Check if any container has a readiness probe.
 	hasProbe := false
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.ReadinessProbe != nil && c.ReadinessProbe.HTTPGet != nil {
 			hasProbe = true
-			go r.runProbe(ctx, ns, name, sandboxIP, c)
+			break
 		}
 	}
+
 	if !hasProbe {
-		r.store.SetWorkloadReady(ns, name, true)
+		r.store.SetWorkloadReady(dep.Namespace, dep.Name, true)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	r.mu.Lock()
+	r.cancels[key] = cancel
+	r.mu.Unlock()
+
+	// Start one goroutine per container with an httpGet probe.
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet == nil {
+			continue
+		}
+		go r.runProbe(ctx, dep.Namespace, dep.Name, sandboxIP, c)
 	}
 }
 
-// Stop cancels the probe goroutine for a workload and marks it not-ready.
+// Stop cancels the probe goroutine for the given workload and marks it
+// not-ready.
 func (r *Runner) Stop(namespace, name string) {
-	key := keyFor(namespace, name)
+	key := namespace + "/" + name
 
 	r.mu.Lock()
 	if cancel, ok := r.cancels[key]; ok {
@@ -75,22 +103,32 @@ func (r *Runner) Stop(namespace, name string) {
 	r.store.SetWorkloadReady(namespace, name, false)
 }
 
-func (r *Runner) runProbe(ctx context.Context, ns, name, ip string, c v1.Container) {
+// runProbe is the per-container probe goroutine. It respects initialDelaySeconds,
+// periodSeconds, successThreshold and failureThreshold from the probe spec.
+func (r *Runner) runProbe(ctx context.Context, namespace, name, sandboxIP string, c v1.Container) {
 	p := c.ReadinessProbe
 	hg := p.HTTPGet
 
 	initialDelay := time.Duration(p.InitialDelaySeconds) * time.Second
 	period := time.Duration(p.PeriodSeconds) * time.Second
-	if period == 0 {
+	if period <= 0 {
 		period = 10 * time.Second
 	}
 	successThreshold := p.SuccessThreshold
-	if successThreshold == 0 {
+	if successThreshold <= 0 {
 		successThreshold = 1
 	}
 	failureThreshold := p.FailureThreshold
-	if failureThreshold == 0 {
+	if failureThreshold <= 0 {
 		failureThreshold = 3
+	}
+
+	if initialDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(initialDelay):
+		}
 	}
 
 	port := resolvePort(hg.Port, c)
@@ -98,17 +136,9 @@ func (r *Runner) runProbe(ctx context.Context, ns, name, ip string, c v1.Contain
 	if path == "" {
 		path = "/"
 	}
-	url := fmt.Sprintf("http://%s:%d%s", ip, port, path)
-	log.Printf("probe: %s/%s initialDelay=%s period=%s url=%s", ns, name, initialDelay, period, url)
-
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(initialDelay):
-	}
+	url := fmt.Sprintf("http://%s:%d%s", sandboxIP, port, path)
 
 	var successes, failures int32
-	ready := false
 
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -118,50 +148,42 @@ func (r *Runner) runProbe(ctx context.Context, ns, name, ip string, c v1.Contain
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if r.doGet(url) {
+			resp, err := r.client.Get(url) //nolint:noctx
+			if err == nil {
+				resp.Body.Close()
+			}
+
+			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
 				failures = 0
 				successes++
-				if !ready && successes >= successThreshold {
-					ready = true
+				if successes >= successThreshold {
+					log.Printf("probe: %s/%s ready (url=%s)", namespace, name, url)
+					r.store.SetWorkloadReady(namespace, name, true)
 					successes = 0
-					r.store.SetWorkloadReady(ns, name, true)
-					log.Printf("probe: %s/%s READY", ns, name)
 				}
 			} else {
 				successes = 0
 				failures++
-				if ready && failures >= failureThreshold {
-					ready = false
+				if failures >= failureThreshold {
+					log.Printf("probe: %s/%s not-ready (url=%s)", namespace, name, url)
+					r.store.SetWorkloadReady(namespace, name, false)
 					failures = 0
-					r.store.SetWorkloadReady(ns, name, false)
-					log.Printf("probe: %s/%s NOT READY", ns, name)
 				}
 			}
 		}
 	}
 }
 
-func (r *Runner) doGet(url string) bool {
-	resp, err := r.client.Get(url) //nolint:noctx
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 400
-}
-
+// resolvePort converts an IntOrString port to an int32. For string values it
+// looks up a named port in the container's Ports list. Falls back to 80.
 func resolvePort(p intstr.IntOrString, c v1.Container) int32 {
 	if p.Type == intstr.Int {
 		return p.IntVal
 	}
 	for _, cp := range c.Ports {
-		if cp.Name == p.String() {
+		if cp.Name == p.StrVal {
 			return cp.ContainerPort
 		}
 	}
 	return 80
-}
-
-func keyFor(namespace, name string) string {
-	return namespace + "/" + name
 }

@@ -160,23 +160,6 @@ func (s *Store) GetWorkloads() []*WorkloadState {
 	return result
 }
 
-// SetWorkloadReady updates the readiness state of a workload.
-func (s *Store) SetWorkloadReady(namespace, name string, ready bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	key := keyFunc(namespace, name)
-	if state, exists := s.workloads[key]; exists {
-		state.Ready = ready
-		if ready {
-			state.ReadyContainers = len(state.ContainerIDs)
-		} else {
-			state.ReadyContainers = 0
-		}
-		state.LastUpdated = time.Now()
-	}
-}
-
 // DeleteWorkload removes a workload from the store.
 func (s *Store) DeleteWorkload(namespace, name string) {
 	s.mu.Lock()
@@ -184,16 +167,38 @@ func (s *Store) DeleteWorkload(namespace, name string) {
 	delete(s.workloads, keyFunc(namespace, name))
 }
 
+// SetWorkloadReady updates the readiness state of a workload. When ready is
+// true, ReadyContainers is set to the number of containers in the workload.
+// When ready is false, ReadyContainers is reset to zero. This is called by
+// the probe.Runner after a readiness threshold is crossed.
+func (s *Store) SetWorkloadReady(namespace, name string, ready bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := keyFunc(namespace, name)
+	state, exists := s.workloads[key]
+	if !exists {
+		return
+	}
+	state.Ready = ready
+	if ready {
+		state.ReadyContainers = len(state.ContainerIDs)
+	} else {
+		state.ReadyContainers = 0
+	}
+	state.LastUpdated = time.Now()
+}
+
 // ── File → workload mappings ──────────────────────────────────────────────────
 
-// SetFileWorkloads records which workload keys ("namespace/name") were loaded from filePath.
+// SetFileWorkloads records which workload keys ("namespace/name") were parsed
+// from the given file path. Used for cleanup when a file is deleted.
 func (s *Store) SetFileWorkloads(filePath string, keys []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fileToWorkloads[filePath] = keys
 }
 
-// GetFileWorkloads returns a copy of workload keys loaded from filePath.
+// GetFileWorkloads returns a copy of the workload keys associated with filePath.
 func (s *Store) GetFileWorkloads(filePath string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -203,7 +208,7 @@ func (s *Store) GetFileWorkloads(filePath string) []string {
 	return result
 }
 
-// DeleteFileWorkloads removes the file→workload mapping for filePath.
+// DeleteFileWorkloads removes the workload key mapping for the given file path.
 func (s *Store) DeleteFileWorkloads(filePath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -285,14 +290,14 @@ func (s *Store) GetAllSecrets() map[string]*v1.Secret {
 
 // ── File → CM/Secret mappings ─────────────────────────────────────────────────
 
-// SetFileCMs records which ConfigMap keys ("namespace/name") were loaded from filePath.
+// SetFileCMs records which ConfigMap keys ("namespace/name") were parsed from filePath.
 func (s *Store) SetFileCMs(filePath string, keys []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fileToCMs[filePath] = keys
 }
 
-// GetFileCMs returns a copy of ConfigMap keys loaded from filePath.
+// GetFileCMs returns a copy of the ConfigMap keys associated with filePath.
 func (s *Store) GetFileCMs(filePath string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -302,21 +307,21 @@ func (s *Store) GetFileCMs(filePath string) []string {
 	return result
 }
 
-// DeleteFileCMs removes the file→ConfigMap mapping for filePath.
+// DeleteFileCMs removes the ConfigMap key mapping for the given file path.
 func (s *Store) DeleteFileCMs(filePath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.fileToCMs, filePath)
 }
 
-// SetFileSecrets records which Secret keys ("namespace/name") were loaded from filePath.
+// SetFileSecrets records which Secret keys ("namespace/name") were parsed from filePath.
 func (s *Store) SetFileSecrets(filePath string, keys []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fileToSecrets[filePath] = keys
 }
 
-// GetFileSecrets returns a copy of Secret keys loaded from filePath.
+// GetFileSecrets returns a copy of the Secret keys associated with filePath.
 func (s *Store) GetFileSecrets(filePath string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -327,6 +332,7 @@ func (s *Store) GetFileSecrets(filePath string) []string {
 }
 
 // DeleteFileSecrets removes the file→Secret mapping for filePath.
+// DeleteFileSecrets removes the Secret key mapping for the given file path.
 func (s *Store) DeleteFileSecrets(filePath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
